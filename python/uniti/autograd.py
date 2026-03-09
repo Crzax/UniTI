@@ -10,6 +10,26 @@ from uniti import init
 # uniti version
 LAZY_MODE = False
 TENSOR_COUNTER = 0
+NO_GRAD = False
+
+
+class no_grad:
+    """Context manager to disable gradient tracking during inference.
+
+    Usage:
+        with uniti.autograd.no_grad():
+            output = model(input)  # no computation graph is built
+    """
+
+    def __enter__(self):
+        global NO_GRAD
+        self._prev = NO_GRAD
+        NO_GRAD = True
+        return self
+
+    def __exit__(self, *args):
+        global NO_GRAD
+        NO_GRAD = self._prev
 
 # NOTE: we will import numpy as the array_api
 # as the backend for our computations, this line will change in later homeworks
@@ -152,7 +172,7 @@ class Value:
         value._init(op, inputs)
 
         if not LAZY_MODE:
-            if not value.requires_grad:
+            if NO_GRAD or not value.requires_grad:
                 return value.detach()
             value.realize_cached_data()
         return value
@@ -237,7 +257,7 @@ class Tensor(Value):
         tensor = Tensor.__new__(Tensor)
         tensor._init(op, inputs)
         if not LAZY_MODE:
-            if not tensor.requires_grad:
+            if NO_GRAD or not tensor.requires_grad:
                 return tensor.detach()
             tensor.realize_cached_data()
         return tensor
@@ -358,6 +378,62 @@ class Tensor(Value):
 
     def transpose(self, axes=None):
         return uniti.ops.Transpose(axes)(self)
+
+    def __getitem__(self, idxs):
+        """Support slicing like t[:, -1:, :] via the Slice op."""
+        if not isinstance(idxs, tuple):
+            idxs = (idxs,)
+        ndim = len(self.shape)
+        # Expand Ellipsis
+        expanded = []
+        for idx in idxs:
+            if idx is Ellipsis:
+                n_missing = ndim - (len(idxs) - 1)
+                expanded.extend([slice(None)] * n_missing)
+            else:
+                expanded.append(idx)
+        # Pad with slice(None) for trailing dims
+        while len(expanded) < ndim:
+            expanded.append(slice(None))
+        # Build (axis, start, stop) tuples
+        slice_specs = []
+        squeeze_axes = []
+        for axis, s in enumerate(expanded):
+            dim_size = self.shape[axis]
+            if isinstance(s, int):
+                # Integer index: normalize negative, select single element
+                idx_val = s if s >= 0 else s + dim_size
+                slice_specs.append((axis, idx_val, idx_val + 1))
+                squeeze_axes.append(axis)
+            elif isinstance(s, slice):
+                start, stop, step = s.indices(dim_size)
+                if step != 1:
+                    raise NotImplementedError("Tensor slicing only supports step=1")
+                slice_specs.append((axis, start, stop))
+            else:
+                raise TypeError(f"Unsupported index type: {type(s)}")
+        # Filter out full-range slices (optimization)
+        filtered = tuple(
+            (ax, st, sp) for ax, st, sp in slice_specs
+            if not (st == 0 and sp == self.shape[ax])
+        )
+        if filtered:
+            result = uniti.ops.tensor_slice(self, filtered)
+        else:
+            result = self
+        # Squeeze integer-indexed dimensions
+        if squeeze_axes:
+            new_shape = tuple(
+                result.shape[i] for i in range(len(result.shape)) if i not in squeeze_axes
+            )
+            if new_shape:
+                result = result.reshape(new_shape)
+            else:
+                result = result.reshape((1,))
+        return result
+
+
+
 
 
 

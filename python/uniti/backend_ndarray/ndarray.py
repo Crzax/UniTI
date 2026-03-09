@@ -377,10 +377,10 @@ class NDArray:
         assert len(idxs) == self.ndim, "Need indexes equal to number of dimensions"
 
          
-        new_shape = tuple([(sl.stop -sl.start + sl.step-1)//sl.step for sl in slices])
-        new_stride = tuple([self.strides[i] * slices[i].step  for i in range(len(self.strides))])
+        new_shape = tuple([(sl.stop -sl.start + sl.step-1)//sl.step for sl in idxs])
+        new_stride = tuple([self.strides[i] * idxs[i].step  for i in range(len(self.strides))])
         new_offset = self._offset
-        for i, s in enumerate(slices):
+        for i, s in enumerate(idxs):
             new_offset += s.start * self.strides[i]
         return NDArray.make(new_shape, new_stride, self.device, self._handle, new_offset) 
          

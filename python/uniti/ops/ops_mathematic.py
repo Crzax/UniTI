@@ -549,3 +549,193 @@ def conv(a, b, stride=1, padding=1):
     return Conv(stride, padding)(a, b)
 
 
+class SiLU(TensorOp):
+    """SiLU (Swish) activation: x * sigmoid(x)"""
+    def compute(self, a: NDArray):
+        exp_neg_a = array_api.exp(-a)
+        self.sigmoid_a = (exp_neg_a + 1) ** (-1)
+        return a * self.sigmoid_a
+
+    def gradient(self, out_grad, node):
+        a = node.inputs[0]
+        sig = Tensor(self.sigmoid_a, device=out_grad.device, dtype=out_grad.dtype, requires_grad=False)
+        return out_grad * (sig + a * sig * (1 - sig))
+
+
+def silu(a):
+    return SiLU()(a)
+
+
+class Sqrt(TensorOp):
+    """Element-wise square root"""
+    def compute(self, a: NDArray):
+        return a ** 0.5
+
+    def gradient(self, out_grad, node):
+        return out_grad / (2.0 * power_scalar(node.inputs[0], 0.5))
+
+
+def sqrt(a):
+    return Sqrt()(a)
+
+
+class Cos(TensorOp):
+    """Element-wise cosine"""
+    def compute(self, a: NDArray):
+        if isinstance(a, numpy.ndarray):
+            return numpy.cos(a)
+        # NDArray backend: go through numpy
+        return type(a)(numpy.cos(a.numpy()), device=a.device)
+
+    def gradient(self, out_grad, node):
+        return -out_grad * sin(node.inputs[0])
+
+
+def cos(a):
+    return Cos()(a)
+
+
+class Sin(TensorOp):
+    """Element-wise sine"""
+    def compute(self, a: NDArray):
+        if isinstance(a, numpy.ndarray):
+            return numpy.sin(a)
+        return type(a)(numpy.sin(a.numpy()), device=a.device)
+
+    def gradient(self, out_grad, node):
+        return out_grad * cos(node.inputs[0])
+
+
+def sin(a):
+    return Sin()(a)
+
+
+class Slice(TensorOp):
+    """Slice a tensor along multiple dimensions using (axis, start, stop) tuples.
+    slices: tuple of (axis, start, stop) — each selects [start:stop] along axis.
+    Unspecified axes keep their full range.
+    """
+    def __init__(self, slices: tuple):
+        # slices: tuple of (axis, start, stop)
+        self.slices = slices
+
+    def compute(self, a: NDArray):
+        idx = [slice(None)] * len(a.shape)
+        for axis, start, stop in self.slices:
+            idx[axis] = slice(start, stop)
+        return a[tuple(idx)]
+
+    def gradient(self, out_grad, node):
+        # Pad gradient back to input shape with zeros
+        input_shape = node.inputs[0].shape
+        # Build pad specification
+        pads = [(0, 0)] * len(input_shape)
+        for axis, start, stop in self.slices:
+            pads[axis] = (start, input_shape[axis] - stop)
+        # Use Stack-based padding: create zeros and place gradient
+        # Simple approach: realize as numpy, pad, wrap back
+        out_np = out_grad.realize_cached_data()
+        if isinstance(out_np, numpy.ndarray):
+            result = numpy.zeros(input_shape, dtype=out_np.dtype)
+            idx = [slice(None)] * len(input_shape)
+            for axis, start, stop in self.slices:
+                idx[axis] = slice(start, stop)
+            result[tuple(idx)] = out_np
+        else:
+            result_np = numpy.zeros(input_shape, dtype="float32")
+            idx = [slice(None)] * len(input_shape)
+            for axis, start, stop in self.slices:
+                idx[axis] = slice(start, stop)
+            result_np[tuple(idx)] = out_np.numpy()
+            result = type(out_np)(result_np, device=out_np.device)
+        return Tensor(result, device=out_grad.device, dtype=out_grad.dtype, requires_grad=False)
+
+
+def tensor_slice(a, slices):
+    """Slice tensor. slices: tuple of (axis, start, stop)."""
+    return Slice(slices)(a)
+
+
+class Concatenate(TensorOp):
+    """Concatenate tensors along an existing axis."""
+    def __init__(self, axis: int):
+        self.axis = axis
+
+    def compute(self, *args):
+        # Convert all to numpy, concatenate, convert back
+        arrays_np = []
+        is_ndarray = not isinstance(args[0], numpy.ndarray)
+        device = None
+        for a in args:
+            if isinstance(a, numpy.ndarray):
+                arrays_np.append(a)
+            else:
+                device = a.device
+                arrays_np.append(a.numpy())
+        result = numpy.concatenate(arrays_np, axis=self.axis)
+        if is_ndarray:
+            from ..backend_ndarray.ndarray import NDArray as BackendNDArray
+            return BackendNDArray(result, device=device)
+        return result
+
+    def gradient(self, out_grad, node):
+        # Split gradient along the concat axis
+        splits = []
+        offset = 0
+        for inp in node.inputs:
+            size = inp.shape[self.axis]
+            s = tensor_slice(out_grad, ((self.axis, offset, offset + size),))
+            splits.append(s)
+            offset += size
+        return tuple(splits)
+
+    def __call__(self, *args):
+        return Tensor.make_from_op(self, args)
+
+
+def concatenate(args, axis):
+    """Concatenate a sequence of tensors along axis."""
+    return Concatenate(axis)(*args)
+
+
+class Max(TensorOp):
+    """Reduce max along an axis (no keepdims — result has axis removed)."""
+    def __init__(self, axis: int):
+        self.axis = axis
+
+    def compute(self, a: NDArray):
+        if isinstance(a, numpy.ndarray):
+            return numpy.max(a, axis=self.axis, keepdims=True)
+        return type(a)(numpy.max(a.numpy(), axis=self.axis, keepdims=True), device=a.device)
+
+    def gradient(self, out_grad, node):
+        # Gradient flows to the max elements
+        a = node.inputs[0]
+        max_val = reduce_max(a, self.axis)
+        max_broad = max_val.broadcast_to(a.shape)
+        # mask where a == max
+        # Use (a >= max - eps) as mask since exact equality can be tricky
+        a_data = a.realize_cached_data()
+        max_data = max_broad.realize_cached_data()
+        if isinstance(a_data, numpy.ndarray):
+            mask_np = (a_data >= max_data - 1e-7).astype(numpy.float32)
+        else:
+            mask_np = (a_data.numpy() >= max_data.numpy() - 1e-7).astype(numpy.float32)
+        mask = Tensor(mask_np, device=a.device, dtype=a.dtype, requires_grad=False)
+        # Normalize mask so gradient sums correctly when multiple maxes
+        count = mask.sum(axes=self.axis)
+        count_shape = list(a.shape)
+        count_shape[self.axis] = 1
+        count = count.reshape(tuple(count_shape)).broadcast_to(a.shape)
+        return out_grad.broadcast_to(a.shape) * mask / count
+
+
+def reduce_max(a, axis):
+    """Reduce max along axis. Result keeps the axis with size 1."""
+    return Max(axis)(a)
+
+
+
+
+
+
