@@ -3,6 +3,8 @@ Supports DeepSeek-R1-Distill-Qwen-1.5B and similar Qwen2 architecture models.
 Training-inference unified: uses UniTi ops throughout, with no_grad() to skip
 autograd graph construction during inference.
 
+Supports both CPU and GPU backends via UniTi's device abstraction.
+
 All computation uses UniTi Tensor and ops — numpy is only used for:
   1. _precompute_freqs_cis (one-time precomputation of RoPE constants)
   2. KV cache buffer storage (mutable state, not part of computation graph)
@@ -17,6 +19,7 @@ from .nn_basic import (
     Module,
     Linear,
 )
+from uniti.backend_selection import NDArray, array_api
 
 
 class RMSNorm(Module):
@@ -140,23 +143,36 @@ class Qwen2Attention(Module):
         self._sin_cache = sin_freqs  # numpy
 
         # Pre-allocated KV cache: (B, kv_heads, max_cache_len, head_dim)
-        self._k_cache = None
-        self._v_cache = None
+        # Stored as NDArray on the same device as model for GPU support
+        self._k_cache = None  # NDArray on device
+        self._v_cache = None  # NDArray on device
         self._cache_len = 0  # number of valid positions in cache
+        self._cache_np_k = None  # numpy buffer for CPU->GPU transfer
+        self._cache_np_v = None
 
     def init_cache(self, batch_size: int, max_cache_len: int):
-        """Pre-allocate KV cache arrays to avoid per-step concatenation."""
-        self._k_cache = np.zeros(
-            (batch_size, self.num_kv_heads, max_cache_len, self.head_dim), dtype=np.float32
-        )
-        self._v_cache = np.zeros(
-            (batch_size, self.num_kv_heads, max_cache_len, self.head_dim), dtype=np.float32
-        )
+        """Pre-allocate KV cache arrays to avoid per-step concatenation.
+        Creates both numpy buffers and device NDArrays for efficient update.
+        """
+        shape = (batch_size, self.num_kv_heads, max_cache_len, self.head_dim)
+        # Numpy buffers for accumulating KV (CPU side, for setitem)
+        self._cache_np_k = np.zeros(shape, dtype=np.float32)
+        self._cache_np_v = np.zeros(shape, dtype=np.float32)
+        # Device arrays for computation
+        if self.device is not None and hasattr(self.device, 'name') and self.device.name == 'cuda':
+            # Pre-allocate on GPU
+            self._k_cache = array_api.NDArray(self._cache_np_k, device=self.device)
+            self._v_cache = array_api.NDArray(self._cache_np_v, device=self.device)
+        else:
+            self._k_cache = None
+            self._v_cache = None
         self._cache_len = 0
 
     def reset_cache(self):
         self._k_cache = None
         self._v_cache = None
+        self._cache_np_k = None
+        self._cache_np_v = None
         self._cache_len = 0
 
     def _softmax(self, logit: Tensor) -> Tensor:
@@ -213,17 +229,19 @@ class Qwen2Attention(Module):
         q = apply_rotary_emb(q, cos_t, sin_t)
         k = apply_rotary_emb(k, cos_t, sin_t)
 
-        # KV Cache handling — pre-allocated numpy buffer for mutable state
-        # We extract data to write into the cache, then wrap the valid range as Tensor
+        # KV Cache handling — use numpy buffers for mutable state
+        # Then convert to device Tensor for computation
         k_data = k.numpy()
         v_data = v.numpy()
         end_pos = start_pos + seq_length
-        if self._k_cache is not None:
-            self._k_cache[:, :, start_pos:end_pos, :] = k_data
-            self._v_cache[:, :, start_pos:end_pos, :] = v_data
+        if self._cache_np_k is not None and self._cache_np_v is not None:
+            # Update numpy cache
+            self._cache_np_k[:, :, start_pos:end_pos, :] = k_data
+            self._cache_np_v[:, :, start_pos:end_pos, :] = v_data
             self._cache_len = end_pos
-            k = Tensor(self._k_cache[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
-            v = Tensor(self._v_cache[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
+            # Create Tensor from cached data (will be on correct device)
+            k = Tensor(self._cache_np_k[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
+            v = Tensor(self._cache_np_v[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
 
         total_len = k.shape[2]
 
