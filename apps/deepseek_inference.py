@@ -69,6 +69,7 @@ def load_weights_into_model(model: Qwen2ForCausalLM, state_dict: dict, device=No
 
     # Embedding
     _set_param(model.model.embed_tokens.weight, state_dict["model.embed_tokens.weight"])
+    model.model.embed_tokens._invalidate_cache()  # clear numpy cache after weight update
 
     # LM head
     if "lm_head.weight" in state_dict:

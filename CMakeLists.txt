@@ -33,8 +33,19 @@ list(APPEND LINKER_LIBS ${pybind11_LIBRARIES})
 ###################
 ### CPU BACKEND ###
 ###################
+# Find OpenBLAS for high-performance matrix multiplication
+find_path(CBLAS_INCLUDE_DIR cblas.h
+  HINTS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
+)
+find_library(OPENBLAS_LIB openblas
+  HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+)
+message(STATUS "OpenBLAS include: ${CBLAS_INCLUDE_DIR}")
+message(STATUS "OpenBLAS lib: ${OPENBLAS_LIB}")
+
 add_library(ndarray_backend_cpu MODULE src/ndarray_backend_cpu.cc)
-target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS})
+target_include_directories(ndarray_backend_cpu PRIVATE ${CBLAS_INCLUDE_DIR})
+target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS} ${OPENBLAS_LIB})
 pybind11_extension(ndarray_backend_cpu)
 pybind11_strip(ndarray_backend_cpu)
 

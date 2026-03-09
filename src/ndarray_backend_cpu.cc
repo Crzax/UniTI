@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cstring>
 
+// OpenBLAS for high-performance matrix multiplication
+#include <cblas.h>
+
 namespace uniti {
 namespace cpu {
 
@@ -275,8 +278,8 @@ void EwiseTanh(const AlignedArray& a, AlignedArray* out) {
 void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uint32_t m, uint32_t n,
             uint32_t p) {
   /**
-   * Multiply two (compact) matrices into an output (also compact) matrix.  For this implementation
-   * you can use the "naive" three-loop algorithm.
+   * Multiply two (compact) matrices into an output (also compact) matrix.
+   * Uses OpenBLAS cblas_sgemm for high performance.
    *
    * Args:
    *   a: compact 2D array of size m x n
@@ -288,13 +291,15 @@ void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uin
    */
 
   /// BEGIN SOLUTION
-  for (int i = 0; i < m; ++i)
-    for (int j = 0; j < p; ++j) {
-      scalar_t c = 0;
-      for (int k = 0; k < n; ++k) 
-        c += a.ptr[i * n + k] * b.ptr[k * p + j];
-      out->ptr[i * p + j] = c;
-    }
+  // C = alpha * A * B + beta * C
+  // A is m x n, B is n x p, C is m x p, all row-major
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+              m, p, n,
+              1.0f,          // alpha
+              a.ptr, n,      // A, lda
+              b.ptr, p,      // B, ldb
+              0.0f,          // beta
+              out->ptr, p);  // C, ldc
   /// END SOLUTION
 }
 
@@ -324,10 +329,14 @@ inline void AlignedDot(const float* __restrict__ a,
   out = (float*)__builtin_assume_aligned(out, TILE * ELEM_SIZE);
 
   /// BEGIN SOLUTION
-  for (size_t i = 0; i < TILE; ++i)
-    for (size_t j = 0; j < TILE; ++j)
-      for (size_t k = 0; k < TILE; ++k)
-        out[i * TILE + j] += a[i * TILE + k] * b[k * TILE + j];
+  // Use BLAS for TILE x TILE multiply-add: out += a * b
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+              TILE, TILE, TILE,
+              1.0f,      // alpha
+              a, TILE,   // A, lda
+              b, TILE,   // B, ldb
+              1.0f,      // beta = 1.0 because we ADD to out
+              out, TILE); // C, ldc
   /// END SOLUTION
 }
 
@@ -414,6 +423,7 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
 
   m.attr("__device_name__") = "cpu";
   m.attr("__tile_size__") = TILE;
+  m.attr("_has_blas") = true;
 
   py::class_<AlignedArray>(m, "Array")
       .def(py::init<size_t>(), py::return_value_policy::take_ownership)

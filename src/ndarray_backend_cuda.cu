@@ -501,9 +501,11 @@ __global__ void MatmulKernel(const scalar_t* a, const scalar_t* b, scalar_t* out
   int tx = threadIdx.x, ty = threadIdx.y;
   int grow = blockIdx.y * blockDim.y;
   int gcol = blockIdx.x * blockDim.x;
+#pragma unroll
   for (int i = 0; i < (N + S - 1)/ S; ++i) {
     // global->shared
     int nthreads = blockDim.x * blockDim.y;
+#pragma unroll
     for (int j = 0; j < S*L*TILE / nthreads; ++j) {
       int thread_idx = ty * blockDim.x + tx;
       int sa_row = (j * nthreads + thread_idx) / (L*TILE);
@@ -514,6 +516,7 @@ __global__ void MatmulKernel(const scalar_t* a, const scalar_t* b, scalar_t* out
       } else
         sA[sa_row][sa_col] = 0.0;
     }
+#pragma unroll
     for (int j = 0; j < S * L * TILE / nthreads; ++j) {
       int thread_idx = ty * blockDim.x + tx;
       int sb_row = (j * nthreads + thread_idx) / (L*TILE);
@@ -526,6 +529,7 @@ __global__ void MatmulKernel(const scalar_t* a, const scalar_t* b, scalar_t* out
     }
     __syncthreads();
     // compute
+#pragma unroll
     for (int j = 0; j < S; ++ j) {
       // shared->register
       scalar_t a[TILE] = {0};
@@ -544,7 +548,9 @@ __global__ void MatmulKernel(const scalar_t* a, const scalar_t* b, scalar_t* out
     __syncthreads();
   }
   // register -> global
+#pragma unroll
   for (int i = 0; i < TILE; ++i)
+#pragma unroll
     for (int j = 0; j < TILE; ++j) {
       int out_row = grow * TILE + ty * TILE + i;
       int out_col = gcol * TILE + tx * TILE + j;

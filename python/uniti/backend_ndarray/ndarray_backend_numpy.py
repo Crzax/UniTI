@@ -10,6 +10,13 @@ class Array:
     def __init__(self, size):
         self.array = np.empty(size, dtype=np.float32)
 
+    @staticmethod
+    def from_flat(flat_array):
+        """Wrap an existing flat float32 numpy array without copying."""
+        arr = Array.__new__(Array)
+        arr.array = flat_array
+        return arr
+
     @property
     def size(self):
         return self.array.size

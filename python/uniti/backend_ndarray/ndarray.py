@@ -107,9 +107,22 @@ class NDArray:
         elif isinstance(other, np.ndarray):
             # create copy from numpy array
             device = device if device is not None else default_device()
-            array = self.make(other.shape, device=device)
-            array.device.from_numpy(np.ascontiguousarray(other), array._handle)
-            self._init(array)
+            # Fast path for cpu_numpy: if the array is already C-contiguous float32,
+            # wrap it directly without copying (zero-copy).
+            if (device.name == "cpu_numpy"
+                    and other.dtype == np.float32
+                    and other.flags['C_CONTIGUOUS']):
+                array = NDArray.__new__(NDArray)
+                array._shape = tuple(other.shape)
+                array._strides = NDArray.compact_strides(other.shape)
+                array._offset = 0
+                array._device = device
+                array._handle = device.Array.from_flat(other.ravel())
+                self._init(array)
+            else:
+                array = self.make(other.shape, device=device)
+                array.device.from_numpy(np.ascontiguousarray(other), array._handle)
+                self._init(array)
         else:
             # see if we can create a numpy array from input
             array = NDArray(np.array(other), device=device)
@@ -519,10 +532,13 @@ class NDArray:
 
         m, n, p = self.shape[0], self.shape[1], other.shape[1]
 
-        # if the matrix is aligned, use tiled matrix multiplication
-        if hasattr(self.device, "matmul_tiled") and all(
-            d % self.device.__tile_size__ == 0 for d in (m, n, p)
-        ):
+        # if the matrix is aligned AND we don't have BLAS (i.e., use tiled for
+        # manual implementations), use tiled matrix multiplication.
+        # When BLAS is available (via matmul), direct matmul is faster.
+        has_blas = hasattr(self.device, "_has_blas") and self.device._has_blas
+        if (not has_blas
+                and hasattr(self.device, "matmul_tiled")
+                and all(d % self.device.__tile_size__ == 0 for d in (m, n, p))):
 
             def tile(a, tile):
                 return a.as_strided(

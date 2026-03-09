@@ -144,26 +144,34 @@ class Qwen2Attention(Module):
 
         # Pre-allocated KV cache: (B, kv_heads, max_cache_len, head_dim)
         # Stored as NDArray on the same device as model for GPU support
-        self._k_cache = None  # NDArray on device
-        self._v_cache = None  # NDArray on device
+        self._k_cache = None  # NDArray on device (GPU mode)
+        self._v_cache = None  # NDArray on device (GPU mode)
+        self._cache_np_k = None  # numpy buffer (CPU mode)
+        self._cache_np_v = None  # numpy buffer (CPU mode)
         self._cache_len = 0  # number of valid positions in cache
-        self._cache_np_k = None  # numpy buffer for CPU->GPU transfer
-        self._cache_np_v = None
+        self._max_cache_len = 0  # max cache capacity
 
     def init_cache(self, batch_size: int, max_cache_len: int):
         """Pre-allocate KV cache arrays to avoid per-step concatenation.
-        Creates both numpy buffers and device NDArrays for efficient update.
+        For GPU: allocates NDArray directly on device to avoid CPU<->GPU transfers.
+        For CPU: uses numpy arrays.
         """
         shape = (batch_size, self.num_kv_heads, max_cache_len, self.head_dim)
-        # Numpy buffers for accumulating KV (CPU side, for setitem)
-        self._cache_np_k = np.zeros(shape, dtype=np.float32)
-        self._cache_np_v = np.zeros(shape, dtype=np.float32)
-        # Device arrays for computation
-        if self.device is not None and hasattr(self.device, 'name') and self.device.name == 'cuda':
-            # Pre-allocate on GPU
-            self._k_cache = array_api.NDArray(self._cache_np_k, device=self.device)
-            self._v_cache = array_api.NDArray(self._cache_np_v, device=self.device)
+        self._max_cache_len = max_cache_len
+        # Check if using GPU (CUDA device)
+        is_cuda = (self.device is not None and 
+                   hasattr(self.device, 'name') and 
+                   self.device.name == 'cuda')
+        if is_cuda:
+            # GPU mode: allocate directly on device, no numpy buffers needed
+            self._k_cache = array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device)
+            self._v_cache = array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device)
+            self._cache_np_k = None
+            self._cache_np_v = None
         else:
+            # CPU mode: use numpy buffers
+            self._cache_np_k = np.zeros(shape, dtype=np.float32)
+            self._cache_np_v = np.zeros(shape, dtype=np.float32)
             self._k_cache = None
             self._v_cache = None
         self._cache_len = 0
@@ -174,6 +182,7 @@ class Qwen2Attention(Module):
         self._cache_np_k = None
         self._cache_np_v = None
         self._cache_len = 0
+        self._max_cache_len = 0
 
     def _softmax(self, logit: Tensor) -> Tensor:
         """Numerically stable softmax over last dimension — pure UniTi ops."""
@@ -229,17 +238,28 @@ class Qwen2Attention(Module):
         q = apply_rotary_emb(q, cos_t, sin_t)
         k = apply_rotary_emb(k, cos_t, sin_t)
 
-        # KV Cache handling — use numpy buffers for mutable state
-        # Then convert to device Tensor for computation
-        k_data = k.numpy()
-        v_data = v.numpy()
+        # KV Cache handling
         end_pos = start_pos + seq_length
-        if self._cache_np_k is not None and self._cache_np_v is not None:
-            # Update numpy cache
+        
+        if self._k_cache is not None and self._v_cache is not None:
+            # GPU mode: update cache directly on device (no CPU<->GPU transfer!)
+            # Get the underlying NDArray from Tensor's cached_data
+            k_nd = k.realize_cached_data()
+            v_nd = v.realize_cached_data()
+            # Direct setitem on GPU NDArray
+            self._k_cache[:, :, start_pos:end_pos, :] = k_nd
+            self._v_cache[:, :, start_pos:end_pos, :] = v_nd
+            self._cache_len = end_pos
+            # Wrap sliced cache as Tensor using make_const (no grad, direct NDArray)
+            k = Tensor.make_const(self._k_cache[:, :, :end_pos, :], requires_grad=False)
+            v = Tensor.make_const(self._v_cache[:, :, :end_pos, :], requires_grad=False)
+        elif self._cache_np_k is not None and self._cache_np_v is not None:
+            # CPU mode: use numpy buffers
+            k_data = k.numpy()
+            v_data = v.numpy()
             self._cache_np_k[:, :, start_pos:end_pos, :] = k_data
             self._cache_np_v[:, :, start_pos:end_pos, :] = v_data
             self._cache_len = end_pos
-            # Create Tensor from cached data (will be on correct device)
             k = Tensor(self._cache_np_k[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
             v = Tensor(self._cache_np_v[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
 
@@ -349,7 +369,14 @@ class Qwen2DecoderLayer(Module):
 
 
 class QwenEmbedding(Module):
-    """Embedding layer using numpy index lookup."""
+    """Embedding layer using numpy index lookup.
+
+    For CUDA devices, caches a CPU-side numpy copy of the embedding table to
+    avoid transferring the full weight matrix (e.g. 933 MB for vocab=151936,
+    dim=1536) from GPU to CPU on every forward call.  The cache is lazily
+    built on first forward and invalidated when weights change (e.g. after
+    load_state_dict).
+    """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, device=None, dtype="float32"):
         super().__init__()
@@ -360,6 +387,17 @@ class QwenEmbedding(Module):
         self.weight = Parameter(
             init.randn(num_embeddings, embedding_dim, mean=0, std=1, device=device, dtype=dtype)
         )
+        self._weight_numpy_cache = None  # lazy CPU-side cache
+
+    def _invalidate_cache(self):
+        """Call after weight is updated (e.g. load_state_dict)."""
+        self._weight_numpy_cache = None
+
+    def _get_weight_numpy(self):
+        """Return numpy view/copy of embedding weights, using cache for non-numpy devices."""
+        if self._weight_numpy_cache is None:
+            self._weight_numpy_cache = self.weight.numpy()
+        return self._weight_numpy_cache
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -373,7 +411,7 @@ class QwenEmbedding(Module):
         """
         input_shape = x.shape
         ids = x.numpy().astype(np.int64)
-        weight_data = self.weight.numpy()
+        weight_data = self._get_weight_numpy()
         embedded = weight_data[ids.flatten()].reshape((*input_shape, self.embedding_dim))
         return Tensor(embedded, device=self.device, dtype=self.dtype, requires_grad=False)
 
