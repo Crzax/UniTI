@@ -33,19 +33,31 @@ list(APPEND LINKER_LIBS ${pybind11_LIBRARIES})
 ###################
 ### CPU BACKEND ###
 ###################
-# Find OpenBLAS for high-performance matrix multiplication
+# Find OpenBLAS for high-performance matrix multiplication (optional)
 find_path(CBLAS_INCLUDE_DIR cblas.h
   HINTS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
+        /usr/include/openblas
 )
 find_library(OPENBLAS_LIB openblas
   HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+        /usr/lib64
 )
 message(STATUS "OpenBLAS include: ${CBLAS_INCLUDE_DIR}")
 message(STATUS "OpenBLAS lib: ${OPENBLAS_LIB}")
 
 add_library(ndarray_backend_cpu MODULE src/ndarray_backend_cpu.cc)
-target_include_directories(ndarray_backend_cpu PRIVATE ${CBLAS_INCLUDE_DIR})
-target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS} ${OPENBLAS_LIB})
+
+if(CBLAS_INCLUDE_DIR AND OPENBLAS_LIB)
+  message(STATUS "OpenBLAS found — using BLAS-accelerated matmul")
+  target_compile_definitions(ndarray_backend_cpu PRIVATE USE_OPENBLAS=1)
+  target_include_directories(ndarray_backend_cpu PRIVATE ${CBLAS_INCLUDE_DIR})
+  target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS} ${OPENBLAS_LIB})
+else()
+  message(WARNING "OpenBLAS NOT found — CPU matmul will use naive fallback (slow). "
+                  "Install OpenBLAS for better performance: apt install libopenblas-dev / yum install openblas-devel")
+  target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS})
+endif()
+
 pybind11_extension(ndarray_backend_cpu)
 pybind11_strip(ndarray_backend_cpu)
 

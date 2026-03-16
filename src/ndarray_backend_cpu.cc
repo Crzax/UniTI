@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cstring>
 
-// OpenBLAS for high-performance matrix multiplication
+// OpenBLAS for high-performance matrix multiplication (optional)
+#ifdef USE_OPENBLAS
 #include <cblas.h>
+#endif
 
 namespace uniti {
 namespace cpu {
@@ -291,6 +293,7 @@ void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uin
    */
 
   /// BEGIN SOLUTION
+#ifdef USE_OPENBLAS
   // C = alpha * A * B + beta * C
   // A is m x n, B is n x p, C is m x p, all row-major
   cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
@@ -300,6 +303,18 @@ void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uin
               b.ptr, p,      // B, ldb
               0.0f,          // beta
               out->ptr, p);  // C, ldc
+#else
+  // Naive fallback: O(m*n*p) triple loop
+  std::fill(out->ptr, out->ptr + m * p, 0.0f);
+  for (uint32_t i = 0; i < m; i++) {
+    for (uint32_t k = 0; k < n; k++) {
+      float a_ik = a.ptr[i * n + k];
+      for (uint32_t j = 0; j < p; j++) {
+        out->ptr[i * p + j] += a_ik * b.ptr[k * p + j];
+      }
+    }
+  }
+#endif
   /// END SOLUTION
 }
 
@@ -329,6 +344,7 @@ inline void AlignedDot(const float* __restrict__ a,
   out = (float*)__builtin_assume_aligned(out, TILE * ELEM_SIZE);
 
   /// BEGIN SOLUTION
+#ifdef USE_OPENBLAS
   // Use BLAS for TILE x TILE multiply-add: out += a * b
   cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
               TILE, TILE, TILE,
@@ -337,6 +353,17 @@ inline void AlignedDot(const float* __restrict__ a,
               b, TILE,   // B, ldb
               1.0f,      // beta = 1.0 because we ADD to out
               out, TILE); // C, ldc
+#else
+  // Naive fallback: TILE x TILE multiply-add
+  for (int i = 0; i < TILE; i++) {
+    for (int k = 0; k < TILE; k++) {
+      float a_ik = a[i * TILE + k];
+      for (int j = 0; j < TILE; j++) {
+        out[i * TILE + j] += a_ik * b[k * TILE + j];
+      }
+    }
+  }
+#endif
   /// END SOLUTION
 }
 
