@@ -126,13 +126,28 @@ def top_p_sampling(logits_np, temperature=0.6, top_p=0.95):
 
 
 def generate(model, input_ids, tokenizer, max_new_tokens=100,
-             temperature=0.6, top_p=0.95, eos_token_id=151643, do_sample=True):
+             temperature=0.6, top_p=0.95, eos_token_id=151643, do_sample=True,
+             use_paged_cache=False, paged_block_size=16, paged_max_blocks=256):
     model.reset_cache()
     model.eval()
 
     prompt_len = len(input_ids)
     max_cache_len = prompt_len + max_new_tokens
-    model.init_cache(batch_size=1, max_cache_len=max_cache_len)
+
+    if use_paged_cache:
+        # Paged Attention mode: allocate blocks on-demand
+        cache_mgr = model.init_paged_cache(
+            block_size=paged_block_size,
+            max_num_blocks=paged_max_blocks,
+            seq_id=0,
+            initial_len=0,  # blocks allocated dynamically during forward
+        )
+        print(f"  [Paged Attention] block_size={paged_block_size}, "
+              f"max_blocks={paged_max_blocks}, "
+              f"pool_size={paged_max_blocks * paged_block_size} tokens")
+    else:
+        # Contiguous cache mode (legacy)
+        model.init_cache(batch_size=1, max_cache_len=max_cache_len)
 
     ids_np = np.array([input_ids], dtype=np.float32)  # (1, prompt_len)
 
@@ -145,6 +160,11 @@ def generate(model, input_ids, tokenizer, max_new_tokens=100,
         last_logits = logits_np[0, -1, :]
         prefill_t = time.time() - t0
         print(f"  Prefill {prompt_len} tok in {prefill_t:.2f}s ({prompt_len / max(prefill_t, 1e-9):.1f} tok/s)")
+
+    if use_paged_cache:
+        stats = cache_mgr.get_cache_stats()
+        print(f"  [Paged] After prefill: {stats['num_used_blocks']}/{stats['max_num_blocks']} blocks "
+              f"({stats['utilization']:.1f}% used)")
 
     if do_sample and temperature > 0:
         next_tok = top_p_sampling(last_logits, temperature, top_p)
@@ -188,6 +208,12 @@ def generate(model, input_ids, tokenizer, max_new_tokens=100,
     if decode_times:
         avg = np.mean(decode_times)
         print(f"  Decode: {len(decode_times)} tok, avg {avg:.2f}s/tok ({1/avg:.2f} tok/s)")
+    
+    if use_paged_cache:
+        stats = cache_mgr.get_cache_stats()
+        print(f"  [Paged] Final: {stats['num_used_blocks']}/{stats['max_num_blocks']} blocks "
+              f"({stats['utilization']:.1f}% used)")
+    
     return generated
 
 
@@ -196,13 +222,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", default="/home/iclab/LLM_ndl/llaisys/models/DeepSeek-R1-Distill-Qwen-1.5B")
     parser.add_argument("--prompt", default="Hello, how are you?")
-    parser.add_argument("--max_new_tokens", type=int, default=50)
+    parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--no_chat", action="store_true", help="Skip chat template, use raw prompt")
     parser.add_argument("--device", default="cpu_numpy", choices=["cuda", "cpu", "cpu_numpy"],
                         help="Device to run inference on (cuda/cpu/cpu_numpy)")
+    parser.add_argument("--paged", action="store_true",
+                        help="Use Paged Attention for KV cache (vLLM-style block memory management)")
+    parser.add_argument("--block_size", type=int, default=16,
+                        help="Block size for Paged Attention (tokens per page)")
+    parser.add_argument("--max_blocks", type=int, default=256,
+                        help="Maximum number of physical blocks for Paged Attention")
     args = parser.parse_args()
 
     # Get device
@@ -260,6 +292,11 @@ def main():
     print("-" * 50)
 
     # Generate
+    if args.paged:
+        print(f"KV Cache mode: Paged Attention (block_size={args.block_size}, max_blocks={args.max_blocks})")
+    else:
+        print(f"KV Cache mode: Contiguous (pre-allocated)")
+    
     t_start = time.time()
     output_ids = generate(
         model, input_ids, tokenizer,
@@ -268,6 +305,9 @@ def main():
         top_p=args.top_p,
         eos_token_id=config.get("eos_token_id", 151643),
         do_sample=not args.greedy,
+        use_paged_cache=args.paged,
+        paged_block_size=args.block_size,
+        paged_max_blocks=args.max_blocks,
     )
     total = time.time() - t_start
 

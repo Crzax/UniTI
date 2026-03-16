@@ -20,6 +20,7 @@ from .nn_basic import (
     Linear,
 )
 from uniti.backend_selection import NDArray, array_api
+from .paged_attention import PagedKVCacheManager
 
 
 class RMSNorm(Module):
@@ -111,7 +112,16 @@ def _batched_matmul(a: Tensor, b_T: Tensor) -> Tensor:
 
 
 class Qwen2Attention(Module):
-    """Qwen2 GQA with RoPE and pre-allocated KV Cache for incremental decoding."""
+    """Qwen2 GQA with RoPE and KV Cache for incremental decoding.
+    
+    Supports two KV cache modes:
+      1. Contiguous cache (legacy): pre-allocated contiguous buffer per sequence.
+      2. Paged cache (new): uses PagedKVCacheManager for block-based memory management.
+    
+    The mode is determined by which init method is called:
+      - init_cache() -> contiguous mode
+      - set_paged_cache() -> paged mode
+    """
 
     def __init__(
         self,
@@ -142,8 +152,7 @@ class Qwen2Attention(Module):
         self._cos_cache = cos_freqs  # numpy
         self._sin_cache = sin_freqs  # numpy
 
-        # Pre-allocated KV cache: (B, kv_heads, max_cache_len, head_dim)
-        # Stored as NDArray on the same device as model for GPU support
+        # --- Contiguous cache state (legacy mode) ---
         self._k_cache = None  # NDArray on device (GPU mode)
         self._v_cache = None  # NDArray on device (GPU mode)
         self._cache_np_k = None  # numpy buffer (CPU mode)
@@ -151,38 +160,66 @@ class Qwen2Attention(Module):
         self._cache_len = 0  # number of valid positions in cache
         self._max_cache_len = 0  # max cache capacity
 
+        # --- Paged cache state (new mode) ---
+        self._paged_cache_mgr: Optional[PagedKVCacheManager] = None
+        self._paged_layer_idx: int = -1  # which layer this attention belongs to
+        self._paged_seq_id: int = 0  # current sequence id for paged mode
+
     def init_cache(self, batch_size: int, max_cache_len: int):
-        """Pre-allocate KV cache arrays to avoid per-step concatenation.
+        """Pre-allocate contiguous KV cache (legacy mode).
         For GPU: allocates NDArray directly on device to avoid CPU<->GPU transfers.
         For CPU: uses numpy arrays.
         """
+        # Clear paged cache if switching modes
+        self._paged_cache_mgr = None
+        
         shape = (batch_size, self.num_kv_heads, max_cache_len, self.head_dim)
         self._max_cache_len = max_cache_len
-        # Check if using GPU (CUDA device)
         is_cuda = (self.device is not None and 
                    hasattr(self.device, 'name') and 
                    self.device.name == 'cuda')
         if is_cuda:
-            # GPU mode: allocate directly on device, no numpy buffers needed
             self._k_cache = array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device)
             self._v_cache = array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device)
             self._cache_np_k = None
             self._cache_np_v = None
         else:
-            # CPU mode: use numpy buffers
             self._cache_np_k = np.zeros(shape, dtype=np.float32)
             self._cache_np_v = np.zeros(shape, dtype=np.float32)
             self._k_cache = None
             self._v_cache = None
         self._cache_len = 0
 
-    def reset_cache(self):
+    def set_paged_cache(self, cache_mgr: 'PagedKVCacheManager', layer_idx: int, seq_id: int = 0):
+        """Attach a paged KV cache manager to this attention layer.
+        
+        Args:
+            cache_mgr: The shared PagedKVCacheManager instance.
+            layer_idx: This layer's index (used to index into cache_mgr's per-layer blocks).
+            seq_id: The sequence ID to use for cache operations.
+        """
+        # Clear contiguous cache if switching modes
         self._k_cache = None
         self._v_cache = None
         self._cache_np_k = None
         self._cache_np_v = None
         self._cache_len = 0
         self._max_cache_len = 0
+        
+        self._paged_cache_mgr = cache_mgr
+        self._paged_layer_idx = layer_idx
+        self._paged_seq_id = seq_id
+
+    def reset_cache(self):
+        """Reset all cache state (both contiguous and paged)."""
+        self._k_cache = None
+        self._v_cache = None
+        self._cache_np_k = None
+        self._cache_np_v = None
+        self._cache_len = 0
+        self._max_cache_len = 0
+        self._paged_cache_mgr = None
+        self._paged_layer_idx = -1
 
     def _softmax(self, logit: Tensor) -> Tensor:
         """Numerically stable softmax over last dimension — pure UniTi ops."""
@@ -238,23 +275,85 @@ class Qwen2Attention(Module):
         q = apply_rotary_emb(q, cos_t, sin_t)
         k = apply_rotary_emb(k, cos_t, sin_t)
 
-        # KV Cache handling
+        # KV Cache handling — choose between paged and contiguous modes
         end_pos = start_pos + seq_length
         
-        if self._k_cache is not None and self._v_cache is not None:
-            # GPU mode: update cache directly on device (no CPU<->GPU transfer!)
-            # Get the underlying NDArray from Tensor's cached_data
+        if self._paged_cache_mgr is not None:
+            # ====== PAGED ATTENTION MODE ======
+            # Device-unified: data stays on its native device throughout.
+            # GPU: extract NDArray from Tensor, pass directly to paged cache (no CPU transfer)
+            # CPU: extract numpy from Tensor, pass directly to paged cache
+            
+            is_cuda = (self.device is not None and 
+                       hasattr(self.device, 'name') and 
+                       self.device.name == 'cuda')
+            
+            for b in range(batch_size):
+                if is_cuda:
+                    # GPU path: get NDArray directly, slice batch dim -> (num_kv_heads, seq_length, head_dim)
+                    k_nd = k.realize_cached_data()  # NDArray: (batch, num_kv_heads, seq_length, head_dim)
+                    v_nd = v.realize_cached_data()
+                    # Slice out this batch element: (1, num_kv_heads, seq_length, head_dim) -> compact -> reshape
+                    k_b = k_nd[b:b+1, :, :, :].compact().reshape(
+                        (self.num_kv_heads, seq_length, self.head_dim))
+                    v_b = v_nd[b:b+1, :, :, :].compact().reshape(
+                        (self.num_kv_heads, seq_length, self.head_dim))
+                    # append_kv accepts NDArray directly — stays on GPU
+                    self._paged_cache_mgr.append_kv(
+                        seq_id=self._paged_seq_id + b,
+                        layer_idx=self._paged_layer_idx,
+                        k_data=k_b,
+                        v_data=v_b,
+                    )
+                else:
+                    # CPU path: extract numpy
+                    k_np = k.numpy()  # (batch_size, num_kv_heads, seq_length, head_dim)
+                    v_np = v.numpy()
+                    self._paged_cache_mgr.append_kv(
+                        seq_id=self._paged_seq_id + b,
+                        layer_idx=self._paged_layer_idx,
+                        k_data=k_np[b],  # (num_kv_heads, seq_length, head_dim)
+                        v_data=v_np[b],
+                    )
+            
+            # Gather full KV cache from paged blocks
+            # gather_kv_tensor is device-unified: GPU returns GPU Tensor, CPU returns CPU Tensor
+            if batch_size == 1:
+                k, v = self._paged_cache_mgr.gather_kv_tensor(
+                    seq_id=self._paged_seq_id,
+                    layer_idx=self._paged_layer_idx,
+                )
+            else:
+                # Batch mode: gather per sequence and stack
+                k_list, v_list = [], []
+                for b in range(batch_size):
+                    k_b, v_b = self._paged_cache_mgr.gather_kv_tensor(
+                        seq_id=self._paged_seq_id + b,
+                        layer_idx=self._paged_layer_idx,
+                    )
+                    k_list.append(k_b.numpy())
+                    v_list.append(v_b.numpy())
+                k = Tensor(
+                    np.concatenate(k_list, axis=0),
+                    device=self.device, dtype=self.dtype, requires_grad=False
+                )
+                v = Tensor(
+                    np.concatenate(v_list, axis=0),
+                    device=self.device, dtype=self.dtype, requires_grad=False
+                )
+
+        elif self._k_cache is not None and self._v_cache is not None:
+            # ====== CONTIGUOUS CACHE MODE (GPU) ======
             k_nd = k.realize_cached_data()
             v_nd = v.realize_cached_data()
-            # Direct setitem on GPU NDArray
             self._k_cache[:, :, start_pos:end_pos, :] = k_nd
             self._v_cache[:, :, start_pos:end_pos, :] = v_nd
             self._cache_len = end_pos
-            # Wrap sliced cache as Tensor using make_const (no grad, direct NDArray)
             k = Tensor.make_const(self._k_cache[:, :, :end_pos, :], requires_grad=False)
             v = Tensor.make_const(self._v_cache[:, :, :end_pos, :], requires_grad=False)
+            
         elif self._cache_np_k is not None and self._cache_np_v is not None:
-            # CPU mode: use numpy buffers
+            # ====== CONTIGUOUS CACHE MODE (CPU) ======
             k_data = k.numpy()
             v_data = v.numpy()
             self._cache_np_k[:, :, start_pos:end_pos, :] = k_data
@@ -275,14 +374,10 @@ class Qwen2Attention(Module):
 
         # Causal mask — built using UniTi ops
         if seq_length > 1:
-            # Build upper-triangular mask: positions where token should NOT attend
-            # triu_k = total_len - seq_length + 1 means: for prefill, mask future tokens
             triu_k = total_len - seq_length + 1
-            # Create mask array: 1.0 where masked, 0.0 where allowed
             mask_data = np.triu(
                 np.ones((seq_length, total_len), dtype=np.float32), k=triu_k
             )
-            # Convert to large negative where masked
             mask_data = -3.4028235e+38 * mask_data
             mask_t = Tensor(mask_data, device=self.device, dtype=self.dtype, requires_grad=False)
             mask_t = mask_t.reshape((1, 1, seq_length, total_len)).broadcast_to(attn_weights.shape)
@@ -435,6 +530,12 @@ class Qwen2Model(Module):
         dtype="float32",
     ):
         super().__init__()
+        self.num_hidden_layers = num_hidden_layers
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = hidden_size // num_attention_heads
+        self.device = device
+        self.dtype = dtype
+        
         self.embed_tokens = QwenEmbedding(vocab_size, hidden_size, device=device, dtype=dtype)
         self.layers = [
             Qwen2DecoderLayer(
@@ -452,14 +553,62 @@ class Qwen2Model(Module):
             for _ in range(num_hidden_layers)
         ]
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
+        
+        # Paged cache manager reference
+        self._paged_cache_mgr: Optional[PagedKVCacheManager] = None
 
     def init_cache(self, batch_size: int, max_cache_len: int):
+        """Initialize contiguous KV cache (legacy mode)."""
         for layer in self.layers:
             layer.self_attn.init_cache(batch_size, max_cache_len)
 
+    def init_paged_cache(
+        self,
+        block_size: int = 16,
+        max_num_blocks: int = 256,
+        seq_id: int = 0,
+        initial_len: int = 0,
+    ) -> PagedKVCacheManager:
+        """Initialize paged KV cache for all attention layers.
+        
+        Creates a shared PagedKVCacheManager and attaches it to all layers.
+        
+        Args:
+            block_size: Number of tokens per page/block.
+            max_num_blocks: Maximum number of physical blocks in the pool.
+            seq_id: Sequence ID to allocate.
+            initial_len: Pre-allocate blocks for this many tokens.
+            
+        Returns:
+            The created PagedKVCacheManager for external inspection/control.
+        """
+        cache_mgr = PagedKVCacheManager(
+            num_layers=self.num_hidden_layers,
+            num_kv_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            block_size=block_size,
+            max_num_blocks=max_num_blocks,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        
+        # Allocate sequence
+        cache_mgr.allocate_sequence(seq_id, initial_len=initial_len)
+        
+        # Attach to all layers
+        for layer_idx, layer in enumerate(self.layers):
+            layer.self_attn.set_paged_cache(cache_mgr, layer_idx, seq_id)
+        
+        self._paged_cache_mgr = cache_mgr
+        return cache_mgr
+
     def reset_cache(self):
+        """Reset all caches (both contiguous and paged)."""
         for layer in self.layers:
             layer.self_attn.reset_cache()
+        if self._paged_cache_mgr is not None:
+            self._paged_cache_mgr.reset()
+            self._paged_cache_mgr = None
 
     def forward(self, input_ids_tensor: Tensor, start_pos: int = 0) -> Tensor:
         """
@@ -475,7 +624,12 @@ class Qwen2Model(Module):
 
 
 class Qwen2ForCausalLM(Module):
-    """Qwen2 model with a language modeling head."""
+    """Qwen2 model with a language modeling head.
+    
+    Supports two KV cache modes for inference:
+      1. Contiguous: model.init_cache(batch_size, max_cache_len)
+      2. Paged: model.init_paged_cache(block_size=16, max_num_blocks=256)
+    """
 
     def __init__(
         self,
@@ -515,9 +669,40 @@ class Qwen2ForCausalLM(Module):
         self.dtype = dtype
 
     def init_cache(self, batch_size: int, max_cache_len: int):
+        """Initialize contiguous KV cache (legacy mode)."""
         self.model.init_cache(batch_size, max_cache_len)
 
+    def init_paged_cache(
+        self,
+        block_size: int = 16,
+        max_num_blocks: int = 256,
+        seq_id: int = 0,
+        initial_len: int = 0,
+    ) -> 'PagedKVCacheManager':
+        """Initialize paged KV cache for all attention layers.
+        
+        This is the recommended mode for inference — it allocates memory
+        on-demand in fixed-size blocks, avoiding the need to pre-allocate
+        max_seq_len of contiguous memory per sequence.
+        
+        Args:
+            block_size: Number of tokens per page/block (default: 16).
+            max_num_blocks: Maximum number of physical blocks in the pool.
+            seq_id: Sequence ID to allocate.
+            initial_len: Pre-allocate blocks for this many tokens.
+            
+        Returns:
+            The created PagedKVCacheManager for monitoring/stats.
+        """
+        return self.model.init_paged_cache(
+            block_size=block_size,
+            max_num_blocks=max_num_blocks,
+            seq_id=seq_id,
+            initial_len=initial_len,
+        )
+
     def reset_cache(self):
+        """Reset all caches."""
         self.model.reset_cache()
 
     def forward(self, input_ids_tensor: Tensor, start_pos: int = 0, last_only: bool = False) -> Tensor:
