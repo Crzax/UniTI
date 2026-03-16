@@ -5,17 +5,23 @@ if(POLICY CMP0146)
 endif()
 
 # find correct version of Python
+# Use the python3 from PATH (conda / venv / system) so the .so suffix matches.
 execute_process(COMMAND python3-config --prefix
-  OUTPUT_VARIABLE Python_ROOT_DIR)
+  OUTPUT_VARIABLE Python_ROOT_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND which python3
+  OUTPUT_VARIABLE _PYTHON3_EXEC
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(Python_EXECUTABLE ${_PYTHON3_EXEC})
 find_package(Python COMPONENTS Development Interpreter REQUIRED)
 include_directories(${Python_INCLUDE_DIRS})
 
-# find pybind
-execute_process(COMMAND python3 -m pybind11 --cmakedir
+# find pybind – prefer the pip/conda-installed version over any system pybind11
+execute_process(COMMAND ${Python_EXECUTABLE} -m pybind11 --cmakedir
   RESULT_VARIABLE __pybind_exit_code
   OUTPUT_VARIABLE __pybind_path
   OUTPUT_STRIP_TRAILING_WHITESPACE)
-find_package(pybind11 PATHS ${__pybind_path})
+find_package(pybind11 PATHS ${__pybind_path} NO_DEFAULT_PATH)
 
 
 if(NOT MSVC)

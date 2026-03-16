@@ -5,8 +5,6 @@ from typing import List, Optional, NamedTuple, Tuple, Union
 from collections import namedtuple
 import numpy
 
-from uniti import init
-
 # uniti version
 LAZY_MODE = False
 TENSOR_COUNTER = 0
@@ -312,7 +310,7 @@ class Tensor(Value):
         out_grad = (
             out_grad
             if out_grad
-            else init.ones(*self.shape, dtype=self.dtype, device=self.device)
+            else uniti.init.ones(*self.shape, dtype=self.dtype, device=self.device)
         )
         compute_gradient_of_variables(self, out_grad)
 
