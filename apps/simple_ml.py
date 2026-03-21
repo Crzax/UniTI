@@ -108,6 +108,7 @@ def nn_epoch(X, y, W1, W2, lr=0.1, batch=100):
       if (i == iter_nums - 1): batch = y.size - i * batch
       y_one_hot = np.zeros((batch,y.max()+1))
       y_one_hot[np.arange(batch),y_batch]=1
+      y_one_hot = uti.Tensor(y_one_hot)
       Z = uti.matmul(uti.relu(uti.matmul(X_batch, W1)), W2)
       loss = softmax_loss(Z,y_one_hot)
       loss.backward()
