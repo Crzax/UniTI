@@ -1,9 +1,7 @@
 from typing import List
 from uniti.autograd import Tensor
-import uniti.backend_ndarray.ndarray as ndarray
 from uniti import ops
 import uniti.init as init
-import numpy as np
 from .nn_sequence import Embedding
 from .nn_basic import (
     Parameter, 
@@ -42,12 +40,11 @@ class MultiHeadAttention(Module):
         """
         return a triangular causal mask.
         Input: i, j: the shape of the mask to be created
+        Uses native device.triu_mask kernel — no numpy dependency.
         """
-        mask = -np.finfo(np.float32).max * np.triu(
-            np.ones((1, 1, i, j), dtype=np.float32), j - i + 1)
-
-        return ndarray.array(
-            mask, device=device)
+        # triu_mask returns (i, j) with shape (1,1,i,j) needed — we'll reshape after
+        mask_2d = device.triu_mask(i, j, k=j - i + 1)
+        return mask_2d.reshape((1, 1, i, j))
 
     def matmul(self, a, b_transpose):
         """
@@ -110,7 +107,7 @@ class MultiHeadAttention(Module):
         probs = None
 
          
-        probs = self.matmul(q, k) / np.sqrt(q_dim)
+        probs = self.matmul(q, k) / (q_dim ** 0.5)
         if self.causal:
             mask = self.create_causal_mask(queries_len, keys_values_len, self.device)
             probs = probs + Tensor(
@@ -354,12 +351,8 @@ class Transformer(Module):
          
         batch_size, seq_len, _ = x.shape
         
-        positions = Tensor(
-            np.arange(seq_len, dtype=np.float32).reshape((1, seq_len)),
-            device=self.device,
-            dtype=self.dtype,
-            requires_grad=False
-        )
+        positions_nd = self.device.arange(seq_len).reshape((1, seq_len))
+        positions = Tensor.make_const(positions_nd, requires_grad=False)
 
         positions = positions.broadcast_to((batch_size, seq_len))
         

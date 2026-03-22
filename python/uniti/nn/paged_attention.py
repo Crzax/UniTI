@@ -10,16 +10,17 @@ This avoids the contiguous pre-allocation problem where each sequence must
 reserve max_seq_len of KV cache memory upfront.
 
 Compatible with UniTi's training-inference unified architecture:
-  - All data stays on the native device: GPU data never crosses to CPU, CPU data stays on CPU.
-  - Uses NDArray operations for GPU mode, numpy operations for CPU mode.
-  - No CPU↔GPU data transfers during append/gather — zero-copy on-device operations.
+  - Three backends: cpu (custom C++), cpu_numpy (numpy wrapper), cuda (custom GPU).
+  - All backends use the unified NDArray API: device.full(), device.empty(),
+    NDArray slice assignment (__setitem__), .compact(), .numpy(), etc.
+  - No backend-specific branching needed — same code path for all devices.
+  - No cross-device data transfers during append/gather — zero-copy on-device operations.
 
 References:
   - vLLM: Efficient Memory Management for Large Language Model Serving
     with PagedAttention (Kwon et al., 2023)
 """
-from typing import Optional, List, Dict, Tuple, Union
-import numpy as np
+from typing import Any, Optional, List, Dict, Tuple, Union
 from uniti.autograd import Tensor
 from uniti import ops
 from .nn_basic import Module
@@ -37,8 +38,11 @@ class PagedKVCacheManager:
     Sequences map logical block indices to physical block indices via page tables.
     
     Device-unified design:
-      - GPU mode: blocks are NDArray on cuda, append/gather use NDArray slice ops (zero CPU transfer)
-      - CPU mode: blocks are numpy arrays, append/gather use numpy indexing
+      All three backends (cpu, cuda, cpu_numpy) use the same NDArray API:
+      - device.full(shape, val) for allocation
+      - NDArray slice assignment for writing KV data
+      - .compact() for making sliced views contiguous
+      - .numpy() for converting to numpy when needed
     """
 
     def __init__(
@@ -69,38 +73,19 @@ class PagedKVCacheManager:
         self.device = device
         self.dtype = dtype
 
-        # Detect device type
-        self._is_cuda = (device is not None and 
-                         hasattr(device, 'name') and 
-                         device.name == 'cuda')
-        self._is_cpu_ndarray = (device is not None and 
-                                hasattr(device, 'name') and 
-                                device.name in ('cpu', 'cpu_numpy'))
-
         # Physical block pool: per-layer K and V caches
         # Shape per layer: (max_num_blocks, num_kv_heads, block_size, head_dim)
+        # All backends use device.full() to allocate NDArray directly on device
         block_shape = (max_num_blocks, num_kv_heads, block_size, head_dim)
         
-        if self._is_cuda:
-            # GPU mode: allocate NDArray blocks on device
-            self.k_cache_blocks = [
-                array_api.NDArray(np.zeros(block_shape, dtype=np.float32), device=device)
-                for _ in range(num_layers)
-            ]
-            self.v_cache_blocks = [
-                array_api.NDArray(np.zeros(block_shape, dtype=np.float32), device=device)
-                for _ in range(num_layers)
-            ]
-        else:
-            # CPU mode: numpy arrays
-            self.k_cache_blocks = [
-                np.zeros(block_shape, dtype=np.float32)
-                for _ in range(num_layers)
-            ]
-            self.v_cache_blocks = [
-                np.zeros(block_shape, dtype=np.float32)
-                for _ in range(num_layers)
-            ]
+        self.k_cache_blocks = [
+            self.device.full(block_shape, 0.0)
+            for _ in range(num_layers)
+        ]
+        self.v_cache_blocks: list[Any] = [
+            self.device.full(block_shape, 0.0)
+            for _ in range(num_layers)
+        ]
 
         # Free block list: all blocks start as free
         self.free_blocks: List[int] = list(range(max_num_blocks))
@@ -108,7 +93,6 @@ class PagedKVCacheManager:
         # Page tables: mapping from sequence_id -> list of physical block indices
         # Each sequence has a list of block indices, where logical_block[i] -> physical_block[page_table[i]]
         self.page_tables: Dict[int, List[int]] = {}
-        
         # Track the number of filled tokens per (seq_id, layer_idx)
         # This allows each layer to append independently (same tokens go through all layers)
         self.seq_layer_lengths: Dict[int, Dict[int, int]] = {}  # seq_id -> {layer_idx -> length}
@@ -203,16 +187,14 @@ class PagedKVCacheManager:
     ):
         """Append new KV pairs to a sequence's cache for a specific layer.
         
-        Device-unified: accepts NDArray (GPU) or numpy (CPU) directly.
-        No cross-device data transfer occurs — data stays on its native device.
+        Device-unified: accepts NDArray on any device (cpu/cuda/cpu_numpy).
+        Uses NDArray slice assignment — no cross-device transfer, all on-device.
         
         Args:
             seq_id: Sequence identifier.
             layer_idx: Transformer layer index.
-            k_data: Key data, shape (num_kv_heads, new_tokens, head_dim).
-                    NDArray for GPU mode, numpy array for CPU mode.
-            v_data: Value data, shape (num_kv_heads, new_tokens, head_dim).
-                    NDArray for GPU mode, numpy array for CPU mode.
+            k_data: Key data, shape (num_kv_heads, new_tokens, head_dim) as NDArray.
+            v_data: Value data, shape (num_kv_heads, new_tokens, head_dim) as NDArray.
         """
         if seq_id not in self.page_tables:
             raise ValueError(f"Sequence {seq_id} not allocated.")
@@ -228,33 +210,22 @@ class PagedKVCacheManager:
         k_blocks = self.k_cache_blocks[layer_idx]
         v_blocks = self.v_cache_blocks[layer_idx]
         
-        if self._is_cuda:
-            # GPU mode: k_data/v_data are NDArray on cuda
-            # Write token by token using NDArray slice assignment (all on GPU, no CPU transfer)
-            for i in range(new_tokens):
-                pos = cur_len + i
-                logical_block = pos // self.block_size
-                offset_in_block = pos % self.block_size
-                physical_block = page_table[logical_block]
-                
-                # Slice the token from input: (num_kv_heads, 1, head_dim) -> compact -> reshape
-                k_token = k_data[:, i:i+1, :].compact().reshape(
-                    (1, self.num_kv_heads, 1, self.head_dim))
-                v_token = v_data[:, i:i+1, :].compact().reshape(
-                    (1, self.num_kv_heads, 1, self.head_dim))
-                
-                # Write directly on GPU via NDArray ewise_setitem
-                k_blocks[physical_block:physical_block+1, :, offset_in_block:offset_in_block+1, :] = k_token
-                v_blocks[physical_block:physical_block+1, :, offset_in_block:offset_in_block+1, :] = v_token
-        else:
-            # CPU mode: k_data/v_data are numpy arrays
-            for i in range(new_tokens):
-                pos = cur_len + i
-                logical_block = pos // self.block_size
-                offset_in_block = pos % self.block_size
-                physical_block = page_table[logical_block]
-                k_blocks[physical_block, :, offset_in_block, :] = k_data[:, i, :]
-                v_blocks[physical_block, :, offset_in_block, :] = v_data[:, i, :]
+        # Write token by token using NDArray slice assignment (all on-device)
+        for i in range(new_tokens):
+            pos = cur_len + i
+            logical_block = pos // self.block_size
+            offset_in_block = pos % self.block_size
+            physical_block = page_table[logical_block]
+            
+            # Slice the token from input: (num_kv_heads, 1, head_dim) -> compact -> reshape
+            k_token = k_data[:, i:i+1, :].compact().reshape(
+                (1, self.num_kv_heads, 1, self.head_dim))
+            v_token = v_data[:, i:i+1, :].compact().reshape(
+                (1, self.num_kv_heads, 1, self.head_dim))
+            
+            # Write directly on-device via NDArray __setitem__ (ewise_setitem)
+            k_blocks[physical_block:physical_block+1, :, offset_in_block:offset_in_block+1, :] = k_token
+            v_blocks[physical_block:physical_block+1, :, offset_in_block:offset_in_block+1, :] = v_token
         
         self.seq_layer_lengths[seq_id][layer_idx] = target_len
 
@@ -262,9 +233,10 @@ class PagedKVCacheManager:
         self,
         seq_id: int,
         layer_idx: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Gather the full KV cache for a sequence by reading from paged blocks.
-        CPU-only path: returns numpy arrays.
+    ) -> Tuple:
+        """Gather the full KV cache for a sequence as numpy arrays.
+        
+        Reads from paged NDArray blocks, converts to numpy for output.
         
         Args:
             seq_id: Sequence identifier.
@@ -279,40 +251,39 @@ class PagedKVCacheManager:
         seq_len = self.seq_layer_lengths[seq_id].get(layer_idx, 0)
         if seq_len == 0:
             shape = (self.num_kv_heads, 0, self.head_dim)
-            return np.zeros(shape, dtype=np.float32), np.zeros(shape, dtype=np.float32)
+            # Allocate empty on device, then convert to numpy
+            k_empty = self.device.full(shape, 0.0)
+            v_empty = self.device.full(shape, 0.0)
+            return k_empty.numpy(), v_empty.numpy()
         
         page_table = self.page_tables[seq_id]
         k_blocks = self.k_cache_blocks[layer_idx]
         v_blocks = self.v_cache_blocks[layer_idx]
         
-        # Pre-allocate output
-        k_out = np.zeros((self.num_kv_heads, seq_len, self.head_dim), dtype=np.float32)
-        v_out = np.zeros((self.num_kv_heads, seq_len, self.head_dim), dtype=np.float32)
+        # Allocate output NDArray on device, then gather block by block
+        out_shape = (self.num_kv_heads, seq_len, self.head_dim)
+        k_out = self.device.full(out_shape, 0.0)
+        v_out = self.device.full(out_shape, 0.0)
         
-        # Copy block by block
+        # Copy block by block using NDArray slice ops
         for logical_idx, physical_idx in enumerate(page_table):
             start_in_seq = logical_idx * self.block_size
             tokens_in_block = min(self.block_size, seq_len - start_in_seq)
             if tokens_in_block <= 0:
                 break
             
-            if self._is_cuda:
-                # GPU -> numpy (only used when explicitly requesting numpy output)
-                k_slice = k_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :]
-                v_slice = v_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :]
-                k_block_data = k_slice.numpy().reshape(
-                    self.num_kv_heads, tokens_in_block, self.head_dim)
-                v_block_data = v_slice.numpy().reshape(
-                    self.num_kv_heads, tokens_in_block, self.head_dim)
-                k_out[:, start_in_seq:start_in_seq+tokens_in_block, :] = k_block_data
-                v_out[:, start_in_seq:start_in_seq+tokens_in_block, :] = v_block_data
-            else:
-                k_out[:, start_in_seq:start_in_seq+tokens_in_block, :] = \
-                    k_blocks[physical_idx, :, :tokens_in_block, :]
-                v_out[:, start_in_seq:start_in_seq+tokens_in_block, :] = \
-                    v_blocks[physical_idx, :, :tokens_in_block, :]
+            # Source: (1, num_kv_heads, tokens_in_block, head_dim) -> reshape to (num_kv_heads, tokens_in_block, head_dim)
+            k_src = k_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :].compact().reshape(
+                (self.num_kv_heads, tokens_in_block, self.head_dim))
+            v_src = v_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :].compact().reshape(
+                (self.num_kv_heads, tokens_in_block, self.head_dim))
+            
+            # Write to output via NDArray slice assignment
+            k_out[:, start_in_seq:start_in_seq+tokens_in_block, :] = k_src
+            v_out[:, start_in_seq:start_in_seq+tokens_in_block, :] = v_src
         
-        return k_out, v_out
+        # Convert final result to numpy
+        return k_out.numpy(), v_out.numpy()
 
     def gather_kv_as_ndarray(
         self,
@@ -321,12 +292,12 @@ class PagedKVCacheManager:
     ) -> Tuple[NDArray, NDArray]:
         """Gather the full KV cache directly as NDArray on the native device.
         
-        GPU mode: output stays on GPU (no CPU transfer!).
-        CPU mode: output is NDArray on CPU device.
+        All operations stay on-device (no numpy transfer).
+        Output shape: (1, num_kv_heads, seq_len, head_dim).
         
         Note: Each call allocates a new output NDArray of shape (1, num_kv_heads, seq_len, head_dim).
         This is intentional — seq_len grows each step, so we can't reuse a fixed buffer.
-        But allocation is done directly on-device (device.full), NOT via numpy→GPU transfer.
+        But allocation is done directly on-device via device.full(), NOT via numpy transfer.
         
         Returns:
             (k_cache, v_cache): Each of shape (1, num_kv_heads, seq_len, head_dim) as NDArray.
@@ -337,19 +308,13 @@ class PagedKVCacheManager:
         seq_len = self.seq_layer_lengths[seq_id].get(layer_idx, 0)
         if seq_len == 0:
             shape = (1, self.num_kv_heads, 0, self.head_dim)
-            # Even for empty, allocate on-device directly
-            return (self.device.full(shape, 0.0) if self._is_cuda 
-                    else array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device),
-                    self.device.full(shape, 0.0) if self._is_cuda 
-                    else array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device))
+            return self.device.full(shape, 0.0), self.device.full(shape, 0.0)
         
         page_table = self.page_tables[seq_id]
         k_blocks = self.k_cache_blocks[layer_idx]
         v_blocks = self.v_cache_blocks[layer_idx]
         
-        # Allocate output NDArray DIRECTLY on-device (no numpy → GPU transfer!)
-        # device.full() calls NDArray.make() which allocates device memory directly,
-        # then fills with zeros via device.fill() — all on GPU, no CPU involvement.
+        # Allocate output NDArray DIRECTLY on-device (device.full -> NDArray.make -> device.Array -> fill)
         out_shape = (1, self.num_kv_heads, seq_len, self.head_dim)
         k_out = self.device.full(out_shape, 0.0)
         v_out = self.device.full(out_shape, 0.0)
@@ -361,17 +326,13 @@ class PagedKVCacheManager:
             if tokens_in_block <= 0:
                 break
             
-            # Source: (1, num_kv_heads, tokens_in_block, head_dim) from cache block
-            k_src = k_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :]
-            v_src = v_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :]
+            # Source: slice from cache block, compact to make contiguous
+            k_src = k_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :].compact()
+            v_src = v_blocks[physical_idx:physical_idx+1, :, :tokens_in_block, :].compact()
             
-            # Compact before assignment (slice may not be compact)
-            k_src_c = k_src.compact()
-            v_src_c = v_src.compact()
-            
-            # Destination slice in output
-            k_out[:, :, start_in_seq:start_in_seq+tokens_in_block, :] = k_src_c
-            v_out[:, :, start_in_seq:start_in_seq+tokens_in_block, :] = v_src_c
+            # Destination slice in output — NDArray __setitem__ handles on-device copy
+            k_out[:, :, start_in_seq:start_in_seq+tokens_in_block, :] = k_src
+            v_out[:, :, start_in_seq:start_in_seq+tokens_in_block, :] = v_src
         
         return k_out, v_out
 
@@ -382,27 +343,16 @@ class PagedKVCacheManager:
     ) -> Tuple[Tensor, Tensor]:
         """Gather KV cache and return as UniTi Tensors.
         
-        Device-unified: 
-          - GPU mode: gathers directly on GPU via NDArray ops, wraps as Tensor (zero CPU transfer).
-          - CPU mode: gathers as numpy, wraps as Tensor.
+        Device-unified: gathers directly on-device via NDArray ops, wraps as Tensor.
+        No numpy intermediate — uses Tensor.make_const(NDArray) directly.
         
         Returns:
             (k_tensor, v_tensor): Each of shape (1, num_kv_heads, seq_len, head_dim)
         """
-        if self._is_cuda:
-            # GPU path: gather entirely on GPU, wrap NDArray as Tensor directly
-            k_nd, v_nd = self.gather_kv_as_ndarray(seq_id, layer_idx)
-            k_tensor = Tensor.make_const(k_nd, requires_grad=False)
-            v_tensor = Tensor.make_const(v_nd, requires_grad=False)
-            return k_tensor, v_tensor
-        else:
-            # CPU path: gather as numpy, construct Tensor
-            k_np, v_np = self.gather_kv(seq_id, layer_idx)
-            k_np = k_np[np.newaxis, :, :, :]
-            v_np = v_np[np.newaxis, :, :, :]
-            k_tensor = Tensor(k_np, device=self.device, dtype=self.dtype, requires_grad=False)
-            v_tensor = Tensor(v_np, device=self.device, dtype=self.dtype, requires_grad=False)
-            return k_tensor, v_tensor
+        k_nd, v_nd = self.gather_kv_as_ndarray(seq_id, layer_idx)
+        k_tensor = Tensor.make_const(k_nd, requires_grad=False)
+        v_tensor = Tensor.make_const(v_nd, requires_grad=False)
+        return k_tensor, v_tensor
 
     def reset(self):
         """Reset all allocations — free all sequences and blocks."""
@@ -413,17 +363,11 @@ class PagedKVCacheManager:
         self.free_blocks = list(range(self.max_num_blocks))
         self.seq_layer_lengths.clear()
         
-        # Zero out block memory
+        # Re-allocate zeroed block memory directly on device
         block_shape = (self.max_num_blocks, self.num_kv_heads, self.block_size, self.head_dim)
         for layer_idx in range(self.num_layers):
-            if self._is_cuda:
-                self.k_cache_blocks[layer_idx] = array_api.NDArray(
-                    np.zeros(block_shape, dtype=np.float32), device=self.device)
-                self.v_cache_blocks[layer_idx] = array_api.NDArray(
-                    np.zeros(block_shape, dtype=np.float32), device=self.device)
-            else:
-                self.k_cache_blocks[layer_idx][:] = 0
-                self.v_cache_blocks[layer_idx][:] = 0
+            self.k_cache_blocks[layer_idx] = self.device.full(block_shape, 0.0)
+            self.v_cache_blocks[layer_idx] = self.device.full(block_shape, 0.0)
 
     def get_cache_stats(self) -> dict:
         """Return cache utilization statistics."""

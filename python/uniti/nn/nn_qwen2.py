@@ -3,23 +3,20 @@ Supports DeepSeek-R1-Distill-Qwen-1.5B and similar Qwen2 architecture models.
 Training-inference unified: uses UniTi ops throughout, with no_grad() to skip
 autograd graph construction during inference.
 
-Supports both CPU and GPU backends via UniTi's device abstraction.
+Supports all backends (cpu/cuda/cpu_numpy) via UniTi's unified NDArray API.
 
-All computation uses UniTi Tensor and ops — numpy is only used for:
-  1. _precompute_freqs_cis (one-time precomputation of RoPE constants)
-  2. KV cache buffer storage (mutable state, not part of computation graph)
+All computation uses UniTi Tensor and ops.
+All data stays on native device — no cross-backend fallbacks.
 """
 from typing import Optional
 from uniti.autograd import Tensor
 from uniti import ops
 import uniti.init as init
-import numpy as np
 from .nn_basic import (
     Parameter,
     Module,
     Linear,
 )
-from uniti.backend_selection import NDArray, array_api
 from .paged_attention import PagedKVCacheManager
 
 
@@ -58,16 +55,47 @@ class SiLUModule(Module):
         return ops.silu(x)
 
 
-def _precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 10000.0):
-    """Precompute the cos and sin for rotary embeddings.
-    This is a one-time precomputation — uses numpy to build constant arrays
-    that are later sliced and converted to Tensor on each forward pass.
+def _precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 10000.0, device=None):
+    """Precompute the cos and sin for rotary embeddings using native NDArray API.
+    Returns (cos_freqs, sin_freqs) as NDArray on the specified device.
+    Each has shape (max_seq_len, dim).
     """
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
-    t = np.arange(max_seq_len, dtype=np.float32)
-    freqs = np.outer(t, freqs)  # (max_seq_len, dim//2)
-    cos_freqs = np.concatenate([np.cos(freqs), np.cos(freqs)], axis=-1)
-    sin_freqs = np.concatenate([np.sin(freqs), np.sin(freqs)], axis=-1)
+    half_dim = dim // 2
+    # Build freq indices: [0, 2, 4, ..., dim-2] / dim → exponents for theta
+    # arange(half_dim) → [0, 1, ..., half_dim-1], then scale
+    idx = device.arange(half_dim)  # NDArray [0, 1, ..., half_dim-1]
+    idx = idx * (2.0 / dim)  # [0, 2/dim, 4/dim, ...]
+    # freqs = 1 / (theta ** idx) = theta ** (-idx)
+    # NDArray has __pow__ for scalar power
+    freqs = idx * (-1.0)  # [-0, -2/dim, -4/dim, ...]
+    import math
+    log_theta = math.log(theta)
+    # theta^(-idx) = exp(-idx * log(theta))
+    freqs = (freqs * log_theta).exp()  # (half_dim,)
+    
+    # t = [0, 1, ..., max_seq_len-1]
+    t = device.arange(max_seq_len)  # (max_seq_len,)
+    
+    # outer product: freqs_table[i,j] = t[i] * freqs[j]
+    # Broadcast: t -> (max_seq_len, 1), freqs -> (1, half_dim)
+    t_col = t.reshape((max_seq_len, 1)).broadcast_to((max_seq_len, half_dim))
+    freqs_row = freqs.reshape((1, half_dim)).broadcast_to((max_seq_len, half_dim))
+    freqs_table = t_col * freqs_row  # (max_seq_len, half_dim)
+    
+    # cos and sin using native NDArray methods
+    cos_half = freqs_table.cos()  # (max_seq_len, half_dim)
+    sin_half = freqs_table.sin()  # (max_seq_len, half_dim)
+    
+    # Concatenate [cos, cos] and [sin, sin] along last dim → (max_seq_len, dim)
+    # NDArray doesn't have concat — use device.full + slice assignment
+    cos_freqs = device.full((max_seq_len, dim), 0.0)
+    cos_freqs[:, :half_dim] = cos_half
+    cos_freqs[:, half_dim:dim] = cos_half
+    
+    sin_freqs = device.full((max_seq_len, dim), 0.0)
+    sin_freqs[:, :half_dim] = sin_half
+    sin_freqs[:, half_dim:dim] = sin_half
+    
     return cos_freqs, sin_freqs
 
 
@@ -148,15 +176,13 @@ class Qwen2Attention(Module):
         self.v_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, bias=True, device=device, dtype=dtype)
         self.o_proj = Linear(num_attention_heads * self.head_dim, hidden_size, bias=False, device=device, dtype=dtype)
 
-        cos_freqs, sin_freqs = _precompute_freqs_cis(self.head_dim, max_position_embeddings, rope_theta)
-        self._cos_cache = cos_freqs  # numpy
-        self._sin_cache = sin_freqs  # numpy
+        cos_freqs, sin_freqs = _precompute_freqs_cis(self.head_dim, max_position_embeddings, rope_theta, device=device)
+        self._cos_cache = cos_freqs  # NDArray on device
+        self._sin_cache = sin_freqs  # NDArray on device
 
         # --- Contiguous cache state (legacy mode) ---
-        self._k_cache = None  # NDArray on device (GPU mode)
-        self._v_cache = None  # NDArray on device (GPU mode)
-        self._cache_np_k = None  # numpy buffer (CPU mode)
-        self._cache_np_v = None  # numpy buffer (CPU mode)
+        self._k_cache = None  # NDArray on device (all backends)
+        self._v_cache = None  # NDArray on device (all backends)
         self._cache_len = 0  # number of valid positions in cache
         self._max_cache_len = 0  # max cache capacity
 
@@ -167,27 +193,16 @@ class Qwen2Attention(Module):
 
     def init_cache(self, batch_size: int, max_cache_len: int):
         """Pre-allocate contiguous KV cache (legacy mode).
-        For GPU: allocates NDArray directly on device to avoid CPU<->GPU transfers.
-        For CPU: uses numpy arrays.
+        Uses NDArray API (device.full) to allocate directly on-device for all backends.
         """
         # Clear paged cache if switching modes
         self._paged_cache_mgr = None
         
         shape = (batch_size, self.num_kv_heads, max_cache_len, self.head_dim)
         self._max_cache_len = max_cache_len
-        is_cuda = (self.device is not None and 
-                   hasattr(self.device, 'name') and 
-                   self.device.name == 'cuda')
-        if is_cuda:
-            self._k_cache = array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device)
-            self._v_cache = array_api.NDArray(np.zeros(shape, dtype=np.float32), device=self.device)
-            self._cache_np_k = None
-            self._cache_np_v = None
-        else:
-            self._cache_np_k = np.zeros(shape, dtype=np.float32)
-            self._cache_np_v = np.zeros(shape, dtype=np.float32)
-            self._k_cache = None
-            self._v_cache = None
+        # Unified: allocate NDArray directly on device (cpu/cuda/cpu_numpy all support device.full)
+        self._k_cache = self.device.full(shape, 0.0)
+        self._v_cache = self.device.full(shape, 0.0)
         self._cache_len = 0
 
     def set_paged_cache(self, cache_mgr: 'PagedKVCacheManager', layer_idx: int, seq_id: int = 0):
@@ -201,8 +216,6 @@ class Qwen2Attention(Module):
         # Clear contiguous cache if switching modes
         self._k_cache = None
         self._v_cache = None
-        self._cache_np_k = None
-        self._cache_np_v = None
         self._cache_len = 0
         self._max_cache_len = 0
         
@@ -214,8 +227,6 @@ class Qwen2Attention(Module):
         """Reset all cache state (both contiguous and paged)."""
         self._k_cache = None
         self._v_cache = None
-        self._cache_np_k = None
-        self._cache_np_v = None
         self._cache_len = 0
         self._max_cache_len = 0
         self._paged_cache_mgr = None
@@ -262,15 +273,11 @@ class Qwen2Attention(Module):
         k = k.reshape((batch_size, seq_length, self.num_kv_heads, self.head_dim)).transpose(axes=(1, 2))
         v = v.reshape((batch_size, seq_length, self.num_kv_heads, self.head_dim)).transpose(axes=(1, 2))
 
-        # RoPE — slice precomputed cos/sin constants and wrap as Tensor
-        cos_t = Tensor(
-            self._cos_cache[start_pos:start_pos + seq_length],
-            device=self.device, dtype=self.dtype, requires_grad=False
-        )
-        sin_t = Tensor(
-            self._sin_cache[start_pos:start_pos + seq_length],
-            device=self.device, dtype=self.dtype, requires_grad=False
-        )
+        # RoPE — slice precomputed cos/sin NDArray and wrap as Tensor
+        cos_nd = self._cos_cache[start_pos:start_pos + seq_length, :]
+        sin_nd = self._sin_cache[start_pos:start_pos + seq_length, :]
+        cos_t = Tensor.make_const(cos_nd, requires_grad=False)
+        sin_t = Tensor.make_const(sin_nd, requires_grad=False)
 
         q = apply_rotary_emb(q, cos_t, sin_t)
         k = apply_rotary_emb(k, cos_t, sin_t)
@@ -280,70 +287,55 @@ class Qwen2Attention(Module):
         
         if self._paged_cache_mgr is not None:
             # ====== PAGED ATTENTION MODE ======
-            # Device-unified: data stays on its native device throughout.
-            # GPU: extract NDArray from Tensor, pass directly to paged cache (no CPU transfer)
-            # CPU: extract numpy from Tensor, pass directly to paged cache
-            
-            is_cuda = (self.device is not None and 
-                       hasattr(self.device, 'name') and 
-                       self.device.name == 'cuda')
+            # Device-unified: all backends use NDArray through realize_cached_data()
             
             for b in range(batch_size):
-                if is_cuda:
-                    # GPU path: get NDArray directly, slice batch dim -> (num_kv_heads, seq_length, head_dim)
-                    k_nd = k.realize_cached_data()  # NDArray: (batch, num_kv_heads, seq_length, head_dim)
-                    v_nd = v.realize_cached_data()
-                    # Slice out this batch element: (1, num_kv_heads, seq_length, head_dim) -> compact -> reshape
-                    k_b = k_nd[b:b+1, :, :, :].compact().reshape(
-                        (self.num_kv_heads, seq_length, self.head_dim))
-                    v_b = v_nd[b:b+1, :, :, :].compact().reshape(
-                        (self.num_kv_heads, seq_length, self.head_dim))
-                    # append_kv accepts NDArray directly — stays on GPU
-                    self._paged_cache_mgr.append_kv(
-                        seq_id=self._paged_seq_id + b,
-                        layer_idx=self._paged_layer_idx,
-                        k_data=k_b,
-                        v_data=v_b,
-                    )
-                else:
-                    # CPU path: extract numpy
-                    k_np = k.numpy()  # (batch_size, num_kv_heads, seq_length, head_dim)
-                    v_np = v.numpy()
-                    self._paged_cache_mgr.append_kv(
-                        seq_id=self._paged_seq_id + b,
-                        layer_idx=self._paged_layer_idx,
-                        k_data=k_np[b],  # (num_kv_heads, seq_length, head_dim)
-                        v_data=v_np[b],
-                    )
+                # Get NDArray directly from Tensor — works on all backends (cpu/cuda/cpu_numpy)
+                k_nd = k.realize_cached_data()  # NDArray: (batch, num_kv_heads, seq_length, head_dim)
+                v_nd = v.realize_cached_data()
+                # Slice out this batch element: (1, num_kv_heads, seq_length, head_dim) -> compact -> reshape
+                k_b = k_nd[b:b+1, :, :, :].compact().reshape(
+                    (self.num_kv_heads, seq_length, self.head_dim))
+                v_b = v_nd[b:b+1, :, :, :].compact().reshape(
+                    (self.num_kv_heads, seq_length, self.head_dim))
+                # append_kv accepts NDArray directly — stays on native device
+                self._paged_cache_mgr.append_kv(
+                    seq_id=self._paged_seq_id + b,
+                    layer_idx=self._paged_layer_idx,
+                    k_data=k_b,
+                    v_data=v_b,
+                )
             
             # Gather full KV cache from paged blocks
-            # gather_kv_tensor is device-unified: GPU returns GPU Tensor, CPU returns CPU Tensor
             if batch_size == 1:
                 k, v = self._paged_cache_mgr.gather_kv_tensor(
                     seq_id=self._paged_seq_id,
                     layer_idx=self._paged_layer_idx,
                 )
             else:
-                # Batch mode: gather per sequence and stack
+                # Batch mode: gather per sequence as NDArray, concatenate via NDArray, wrap as Tensor
                 k_list, v_list = [], []
                 for b in range(batch_size):
-                    k_b, v_b = self._paged_cache_mgr.gather_kv_tensor(
+                    k_b, v_b = self._paged_cache_mgr.gather_kv_as_ndarray(
                         seq_id=self._paged_seq_id + b,
                         layer_idx=self._paged_layer_idx,
                     )
-                    k_list.append(k_b.numpy())
-                    v_list.append(v_b.numpy())
-                k = Tensor(
-                    np.concatenate(k_list, axis=0),
-                    device=self.device, dtype=self.dtype, requires_grad=False
-                )
-                v = Tensor(
-                    np.concatenate(v_list, axis=0),
-                    device=self.device, dtype=self.dtype, requires_grad=False
-                )
+                    k_list.append(k_b)
+                    v_list.append(v_b)
+                # Concatenate NDArrays along batch dim (axis=0) using device.full + slice assignment
+                total_len = k_list[0].shape[1]  # seq dim
+                k_shape = (batch_size, self.num_kv_heads, total_len, self.head_dim)
+                v_shape = k_shape
+                k_concat = self.device.full(k_shape, 0.0)
+                v_concat = self.device.full(v_shape, 0.0)
+                for b in range(batch_size):
+                    k_concat[b:b+1, :, :, :] = k_list[b]
+                    v_concat[b:b+1, :, :, :] = v_list[b]
+                k = Tensor.make_const(k_concat, requires_grad=False)
+                v = Tensor.make_const(v_concat, requires_grad=False)
 
         elif self._k_cache is not None and self._v_cache is not None:
-            # ====== CONTIGUOUS CACHE MODE (GPU) ======
+            # ====== CONTIGUOUS CACHE MODE (unified NDArray for all backends) ======
             k_nd = k.realize_cached_data()
             v_nd = v.realize_cached_data()
             self._k_cache[:, :, start_pos:end_pos, :] = k_nd
@@ -351,16 +343,6 @@ class Qwen2Attention(Module):
             self._cache_len = end_pos
             k = Tensor.make_const(self._k_cache[:, :, :end_pos, :], requires_grad=False)
             v = Tensor.make_const(self._v_cache[:, :, :end_pos, :], requires_grad=False)
-            
-        elif self._cache_np_k is not None and self._cache_np_v is not None:
-            # ====== CONTIGUOUS CACHE MODE (CPU) ======
-            k_data = k.numpy()
-            v_data = v.numpy()
-            self._cache_np_k[:, :, start_pos:end_pos, :] = k_data
-            self._cache_np_v[:, :, start_pos:end_pos, :] = v_data
-            self._cache_len = end_pos
-            k = Tensor(self._cache_np_k[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
-            v = Tensor(self._cache_np_v[:, :, :end_pos, :], device=self.device, dtype=self.dtype, requires_grad=False)
 
         total_len = k.shape[2]
 
@@ -372,14 +354,11 @@ class Qwen2Attention(Module):
         scale = float(self.head_dim ** 0.5)
         attn_weights = _batched_matmul(q, k) / scale
 
-        # Causal mask — built using UniTi ops
+        # Causal mask — built using native NDArray triu_mask
         if seq_length > 1:
             triu_k = total_len - seq_length + 1
-            mask_data = np.triu(
-                np.ones((seq_length, total_len), dtype=np.float32), k=triu_k
-            )
-            mask_data = -3.4028235e+38 * mask_data
-            mask_t = Tensor(mask_data, device=self.device, dtype=self.dtype, requires_grad=False)
+            mask_nd = self.device.triu_mask(seq_length, total_len, k=triu_k)
+            mask_t = Tensor.make_const(mask_nd, requires_grad=False)
             mask_t = mask_t.reshape((1, 1, seq_length, total_len)).broadcast_to(attn_weights.shape)
             attn_weights = attn_weights + mask_t
 
@@ -464,13 +443,11 @@ class Qwen2DecoderLayer(Module):
 
 
 class QwenEmbedding(Module):
-    """Embedding layer using numpy index lookup.
+    """Embedding layer using native NDArray embedding_lookup.
 
-    For CUDA devices, caches a CPU-side numpy copy of the embedding table to
-    avoid transferring the full weight matrix (e.g. 933 MB for vocab=151936,
-    dim=1536) from GPU to CPU on every forward call.  The cache is lazily
-    built on first forward and invalidated when weights change (e.g. after
-    load_state_dict).
+    All operations stay on the native device — no numpy transfers needed.
+    The weight matrix is stored as a Tensor (NDArray backed), and embedding
+    lookup is performed directly on-device via the embedding_lookup kernel.
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, device=None, dtype="float32"):
@@ -482,33 +459,30 @@ class QwenEmbedding(Module):
         self.weight = Parameter(
             init.randn(num_embeddings, embedding_dim, mean=0, std=1, device=device, dtype=dtype)
         )
-        self._weight_numpy_cache = None  # lazy CPU-side cache
 
     def _invalidate_cache(self):
-        """Call after weight is updated (e.g. load_state_dict)."""
-        self._weight_numpy_cache = None
-
-    def _get_weight_numpy(self):
-        """Return numpy view/copy of embedding weights, using cache for non-numpy devices."""
-        if self._weight_numpy_cache is None:
-            self._weight_numpy_cache = self.weight.numpy()
-        return self._weight_numpy_cache
+        """No-op: kept for backward compatibility. Native embedding needs no cache."""
+        pass
 
     def forward(self, x: Tensor) -> Tensor:
         """
         x: (batch_size, seq_len) - float tensor of token IDs
         Returns: (batch_size, seq_len, embedding_dim)
 
-        Note: Embedding lookup requires integer indexing (gather), which is not
-        expressible as a differentiable tensor operation. We extract IDs via
-        Tensor.numpy() and perform the lookup on weight's underlying data.
-        This is equivalent to one_hot(ids) @ weight but without the O(V) memory.
+        Uses native device.embedding_lookup kernel — all on-device, no numpy.
         """
         input_shape = x.shape
-        ids = x.numpy().astype(np.int64)
-        weight_data = self._get_weight_numpy()
-        embedded = weight_data[ids.flatten()].reshape((*input_shape, self.embedding_dim))
-        return Tensor(embedded, device=self.device, dtype=self.dtype, requires_grad=False)
+        # Flatten IDs to 1D NDArray
+        ids_nd = x.realize_cached_data().compact().reshape((x.shape[0] * x.shape[1],))
+        # Get weight as NDArray (compact flat)
+        weight_nd = self.weight.realize_cached_data().compact().reshape(
+            (self.num_embeddings * self.embedding_dim,))
+        # Actually we need weight as 2D for the kernel — pass flat + embedding_dim
+        num_ids = ids_nd.shape[0]
+        result_nd = self.device.embedding_lookup(weight_nd, ids_nd, self.embedding_dim)
+        # Reshape to (batch_size, seq_len, embedding_dim)
+        result_nd = result_nd.reshape((*input_shape, self.embedding_dim))
+        return Tensor.make_const(result_nd, requires_grad=False)
 
 
 class Qwen2Model(Module):

@@ -256,6 +256,55 @@ void EwiseTanh(const AlignedArray& a, AlignedArray* out) {
     out->ptr[i] = std::tanh(a.ptr[i]);
   }
 }
+
+void EwiseSin(const AlignedArray& a, AlignedArray* out) {
+  for (size_t i = 0; i < a.size; i++) {
+    out->ptr[i] = std::sin(a.ptr[i]);
+  }
+}
+
+void EwiseCos(const AlignedArray& a, AlignedArray* out) {
+  for (size_t i = 0; i < a.size; i++) {
+    out->ptr[i] = std::cos(a.ptr[i]);
+  }
+}
+
+void Arange(AlignedArray* out, size_t n) {
+  /**
+   * Fill output with [0, 1, 2, ..., n-1] as float.
+   */
+  for (size_t i = 0; i < n; i++) {
+    out->ptr[i] = static_cast<scalar_t>(i);
+  }
+}
+
+void TriuMask(AlignedArray* out, size_t rows, size_t cols, int k, scalar_t mask_val) {
+  /**
+   * Build an upper-triangular mask: out[i, j] = mask_val if j >= i + k, else 0.
+   * The output is a compact 2D array of shape (rows, cols).
+   */
+  for (size_t i = 0; i < rows; i++) {
+    for (size_t j = 0; j < cols; j++) {
+      out->ptr[i * cols + j] = (static_cast<int>(j) >= static_cast<int>(i) + k) ? mask_val : 0.0f;
+    }
+  }
+}
+
+void EmbeddingLookup(const AlignedArray& weight, const AlignedArray& ids, AlignedArray* out,
+                     size_t num_ids, size_t embedding_dim) {
+  /**
+   * Lookup embeddings by float IDs (cast to int internally).
+   * weight: flat array of shape (vocab_size, embedding_dim)
+   * ids: flat array of num_ids float values (token IDs)
+   * out: flat array of shape (num_ids, embedding_dim)
+   */
+  for (size_t i = 0; i < num_ids; i++) {
+    int idx = static_cast<int>(ids.ptr[i]);
+    for (size_t j = 0; j < embedding_dim; j++) {
+      out->ptr[i * embedding_dim + j] = weight.ptr[idx * embedding_dim + j];
+    }
+  }
+}
 /**
  * In the code the follows, use the above template to create analogous element-wise
  * and and scalar operators for the following functions.  See the numpy backend for
@@ -495,6 +544,12 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
   m.def("ewise_log", EwiseLog);
   m.def("ewise_exp", EwiseExp);
   m.def("ewise_tanh", EwiseTanh);
+  m.def("ewise_sin", EwiseSin);
+  m.def("ewise_cos", EwiseCos);
+
+  m.def("arange", Arange);
+  m.def("triu_mask", TriuMask);
+  m.def("embedding_lookup", EmbeddingLookup);
 
   m.def("matmul", Matmul);
   m.def("matmul_tiled", MatmulTiled);

@@ -55,6 +55,38 @@ class BackendDevice:
         arr.fill(fill_value)
         return arr
 
+    def arange(self, n):
+        """Return NDArray [0, 1, ..., n-1] on this device."""
+        arr = NDArray.make((n,), device=self)
+        self.mod.arange(arr._handle, n)
+        return arr
+
+    def triu_mask(self, rows, cols, k=1, mask_val=-3.4028235e+38):
+        """Build upper-triangular mask on this device.
+        out[i,j] = mask_val if j >= i + k, else 0.
+        Returns NDArray of shape (rows, cols).
+        """
+        arr = NDArray.make((rows, cols), device=self)
+        self.mod.triu_mask(arr._handle, rows, cols, k, mask_val)
+        return arr
+
+    def embedding_lookup(self, weight_ndarray, ids_ndarray, embedding_dim):
+        """Lookup embedding vectors by float IDs.
+        weight_ndarray: NDArray of shape (vocab_size, embedding_dim) - must be compact flat.
+        ids_ndarray: NDArray of shape (num_ids,) - float token IDs.
+        Returns NDArray of shape (num_ids, embedding_dim).
+        """
+        num_ids = ids_ndarray.shape[0]
+        out = NDArray.make((num_ids, embedding_dim), device=self)
+        self.mod.embedding_lookup(
+            weight_ndarray.compact()._handle,
+            ids_ndarray.compact()._handle,
+            out._handle,
+            num_ids,
+            embedding_dim,
+        )
+        return out
+
 
 def cuda():
     """Return cuda device"""
@@ -289,8 +321,8 @@ class NDArray:
         """
 
          
-        new_shape = tuple(np.array(self.shape)[list(new_axes)])
-        new_strides = tuple(np.array(self.strides)[list(new_axes)])
+        new_shape = tuple(self.shape[a] for a in new_axes)
+        new_strides = tuple(self.strides[a] for a in new_axes)
         return NDArray.make(new_shape, new_strides, self.device, self._handle, self._offset)
          
 
@@ -509,6 +541,16 @@ class NDArray:
         self.device.ewise_tanh(self.compact()._handle, out._handle)
         return out
 
+    def sin(self):
+        out = NDArray.make(self.shape, device=self.device)
+        self.device.ewise_sin(self.compact()._handle, out._handle)
+        return out
+
+    def cos(self):
+        out = NDArray.make(self.shape, device=self.device)
+        self.device.ewise_cos(self.compact()._handle, out._handle)
+        return out
+
     ### Matrix multiplication
     def __matmul__(self, other):
         """Matrix multplication of two arrays.  This requires that both arrays
@@ -679,3 +721,11 @@ def sum(a, axis=None, keepdims=False):
 
 def flip(a, axes):
     return a.flip(axes)
+
+
+def sin(a):
+    return a.sin()
+
+
+def cos(a):
+    return a.cos()

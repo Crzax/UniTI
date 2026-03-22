@@ -4,7 +4,6 @@ from typing import List
 from uniti.autograd import Tensor
 from uniti import ops
 import uniti.init as init
-import numpy as np
 from .nn_basic import Parameter, Module
 
 

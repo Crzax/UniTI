@@ -582,10 +582,7 @@ def sqrt(a):
 class Cos(TensorOp):
     """Element-wise cosine"""
     def compute(self, a: NDArray):
-        if isinstance(a, numpy.ndarray):
-            return numpy.cos(a)
-        # NDArray backend: go through numpy
-        return type(a)(numpy.cos(a.numpy()), device=a.device)
+        return array_api.cos(a)
 
     def gradient(self, out_grad, node):
         return -out_grad * sin(node.inputs[0])
@@ -598,9 +595,7 @@ def cos(a):
 class Sin(TensorOp):
     """Element-wise sine"""
     def compute(self, a: NDArray):
-        if isinstance(a, numpy.ndarray):
-            return numpy.sin(a)
-        return type(a)(numpy.sin(a.numpy()), device=a.device)
+        return array_api.sin(a)
 
     def gradient(self, out_grad, node):
         return out_grad * cos(node.inputs[0])
@@ -628,26 +623,16 @@ class Slice(TensorOp):
     def gradient(self, out_grad, node):
         # Pad gradient back to input shape with zeros
         input_shape = node.inputs[0].shape
-        # Build pad specification
-        pads = [(0, 0)] * len(input_shape)
-        for axis, start, stop in self.slices:
-            pads[axis] = (start, input_shape[axis] - stop)
-        # Use Stack-based padding: create zeros and place gradient
-        # Simple approach: realize as numpy, pad, wrap back
-        out_np = out_grad.realize_cached_data()
-        if isinstance(out_np, numpy.ndarray):
-            result = numpy.zeros(input_shape, dtype=out_np.dtype)
-            idx = [slice(None)] * len(input_shape)
-            for axis, start, stop in self.slices:
-                idx[axis] = slice(start, stop)
-            result[tuple(idx)] = out_np
+        out_data = out_grad.realize_cached_data()
+        # array_api.full works for both numpy and NDArray backends
+        if isinstance(out_data, numpy.ndarray):
+            result = numpy.zeros(input_shape, dtype=out_data.dtype)
         else:
-            result_np = numpy.zeros(input_shape, dtype="float32")
-            idx = [slice(None)] * len(input_shape)
-            for axis, start, stop in self.slices:
-                idx[axis] = slice(start, stop)
-            result_np[tuple(idx)] = out_np.numpy()
-            result = type(out_np)(result_np, device=out_np.device)
+            result = out_data.device.full(input_shape, 0.0)
+        idx = [slice(None)] * len(input_shape)
+        for axis, start, stop in self.slices:
+            idx[axis] = slice(start, stop)
+        result[tuple(idx)] = out_data
         return Tensor(result, device=out_grad.device, dtype=out_grad.dtype, requires_grad=False)
 
 
@@ -662,21 +647,22 @@ class Concatenate(TensorOp):
         self.axis = axis
 
     def compute(self, *args):
-        # Convert all to numpy, concatenate, convert back
-        arrays_np = []
-        is_ndarray = not isinstance(args[0], numpy.ndarray)
-        device = None
+        if isinstance(args[0], numpy.ndarray):
+            return numpy.concatenate(args, axis=self.axis)
+        # NDArray backend: allocate + slice-assign (stays on device)
+        device = args[0].device
+        out_shape = list(args[0].shape)
+        total_axis_len = sum(a.shape[self.axis] for a in args)
+        out_shape[self.axis] = total_axis_len
+        out = device.full(tuple(out_shape), 0.0)
+        offset = 0
         for a in args:
-            if isinstance(a, numpy.ndarray):
-                arrays_np.append(a)
-            else:
-                device = a.device
-                arrays_np.append(a.numpy())
-        result = numpy.concatenate(arrays_np, axis=self.axis)
-        if is_ndarray:
-            from ..backend_ndarray.ndarray import NDArray as BackendNDArray
-            return BackendNDArray(result, device=device)
-        return result
+            size = a.shape[self.axis]
+            idx = [slice(None)] * len(out_shape)
+            idx[self.axis] = slice(offset, offset + size)
+            out[tuple(idx)] = a
+            offset += size
+        return out
 
     def gradient(self, out_grad, node):
         # Split gradient along the concat axis
@@ -706,23 +692,21 @@ class Max(TensorOp):
     def compute(self, a: NDArray):
         if isinstance(a, numpy.ndarray):
             return numpy.max(a, axis=self.axis, keepdims=True)
-        return type(a)(numpy.max(a.numpy(), axis=self.axis, keepdims=True), device=a.device)
+        return a.max(axis=self.axis, keepdims=True)
 
     def gradient(self, out_grad, node):
-        # Gradient flows to the max elements
         a = node.inputs[0]
         max_val = reduce_max(a, self.axis)
         max_broad = max_val.broadcast_to(a.shape)
-        # mask where a == max
-        # Use (a >= max - eps) as mask since exact equality can be tricky
+        # mask where a == max (use a >= max - eps)
         a_data = a.realize_cached_data()
         max_data = max_broad.realize_cached_data()
         if isinstance(a_data, numpy.ndarray):
-            mask_np = (a_data >= max_data - 1e-7).astype(numpy.float32)
+            mask_data = (a_data >= max_data - 1e-7).astype(numpy.float32)
         else:
-            mask_np = (a_data.numpy() >= max_data.numpy() - 1e-7).astype(numpy.float32)
-        mask = Tensor(mask_np, device=a.device, dtype=a.dtype, requires_grad=False)
-        # Normalize mask so gradient sums correctly when multiple maxes
+            # NDArray: scalar sub and >= both supported natively
+            mask_data = a_data >= (max_data - 1e-7)
+        mask = Tensor(mask_data, device=a.device, dtype=a.dtype, requires_grad=False)
         count = mask.sum(axes=self.axis)
         count_shape = list(a.shape)
         count_shape[self.axis] = 1

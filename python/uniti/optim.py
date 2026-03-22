@@ -1,6 +1,5 @@
 """Optimization module"""
 import uniti as uti
-import numpy as np
 
 
 class Optimizer:
@@ -39,16 +38,17 @@ class SGD(Optimizer):
     def clip_grad_norm(self, max_norm=0.25):
         """
         Clips gradient norm of parameters.
-        Note: This does not need to be implemented for HW2 and can be skipped.
+        Uses Tensor ops — no numpy dependency.
         """
-         
         total_norm_sq = 0.0
         for p in self.params:
             if p.grad is not None:
-                grad_np = p.grad.detach().numpy()
-                total_norm_sq += np.sum(grad_np ** 2)
+                # (grad * grad).sum() gives a Tensor with one element
+                grad_sq_sum = (p.grad.detach() * p.grad.detach()).sum()
+                # Extract scalar via .numpy() on the reduced single-element tensor
+                total_norm_sq += float(grad_sq_sum.numpy())
         
-        total_norm = np.sqrt(total_norm_sq)
+        total_norm = total_norm_sq ** 0.5
         clip_coef = max_norm / (total_norm + 1e-6)
 
         if clip_coef < 1.0:

@@ -4,7 +4,7 @@ from typing import List, Callable, Any
 from uniti.autograd import Tensor
 from uniti import ops
 import uniti.init as init
-import numpy as np
+import math
 from .nn_basic import Parameter, Module, BatchNorm2d, ReLU
 
 
@@ -31,7 +31,7 @@ class Conv(Module):
         fan_in = in_channels * (kernel_size ** 2)
         fan_out = out_channels * (kernel_size ** 2)
         self.weight = Parameter(init.kaiming_uniform(fan_in,fan_out,shape=(kernel_size,kernel_size,in_channels,out_channels),device=device,dtype=dtype,requires_grad=True))
-        interval = 1/np.sqrt(in_channels*kernel_size**2)
+        interval = 1/math.sqrt(in_channels*kernel_size**2)
         self.padding = (kernel_size-1)//2
         self.bias = Parameter(init.rand(out_channels,low=-interval, high=interval, device=device,dtype=dtype,requires_grad=True)) if bias else None
          

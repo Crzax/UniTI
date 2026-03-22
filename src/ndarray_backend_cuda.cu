@@ -407,6 +407,77 @@ void EwiseTanh(const CudaArray& a, CudaArray* out) {
   EwiseTanhKernel<<<dim.grid,dim.block>>>(a.ptr, out->ptr, out->size);
 }
 
+__global__ void EwiseSinKernel(const scalar_t* a, scalar_t* out, size_t size) {
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < size) {
+    out[gid] = sinf(a[gid]);
+  }
+}
+
+void EwiseSin(const CudaArray& a, CudaArray* out) {
+  CudaDims dim = CudaOneDim(out->size);
+  EwiseSinKernel<<<dim.grid, dim.block>>>(a.ptr, out->ptr, out->size);
+}
+
+__global__ void EwiseCosKernel(const scalar_t* a, scalar_t* out, size_t size) {
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < size) {
+    out[gid] = cosf(a[gid]);
+  }
+}
+
+void EwiseCos(const CudaArray& a, CudaArray* out) {
+  CudaDims dim = CudaOneDim(out->size);
+  EwiseCosKernel<<<dim.grid, dim.block>>>(a.ptr, out->ptr, out->size);
+}
+
+__global__ void ArangeKernel(scalar_t* out, size_t n) {
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < n) {
+    out[gid] = static_cast<scalar_t>(gid);
+  }
+}
+
+void Arange(CudaArray* out, size_t n) {
+  CudaDims dim = CudaOneDim(n);
+  ArangeKernel<<<dim.grid, dim.block>>>(out->ptr, n);
+}
+
+__global__ void TriuMaskKernel(scalar_t* out, size_t rows, size_t cols, int k, scalar_t mask_val) {
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = rows * cols;
+  if (gid < total) {
+    size_t i = gid / cols;
+    size_t j = gid % cols;
+    out[gid] = (static_cast<int>(j) >= static_cast<int>(i) + k) ? mask_val : 0.0f;
+  }
+}
+
+void TriuMask(CudaArray* out, size_t rows, size_t cols, int k, scalar_t mask_val) {
+  size_t total = rows * cols;
+  CudaDims dim = CudaOneDim(total);
+  TriuMaskKernel<<<dim.grid, dim.block>>>(out->ptr, rows, cols, k, mask_val);
+}
+
+__global__ void EmbeddingLookupKernel(const scalar_t* weight, const scalar_t* ids,
+                                       scalar_t* out, size_t num_ids, size_t embedding_dim) {
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = num_ids * embedding_dim;
+  if (gid < total) {
+    size_t token_idx = gid / embedding_dim;
+    size_t dim_idx = gid % embedding_dim;
+    int vocab_idx = static_cast<int>(ids[token_idx]);
+    out[gid] = weight[vocab_idx * embedding_dim + dim_idx];
+  }
+}
+
+void EmbeddingLookup(const CudaArray& weight, const CudaArray& ids, CudaArray* out,
+                     size_t num_ids, size_t embedding_dim) {
+  size_t total = num_ids * embedding_dim;
+  CudaDims dim = CudaOneDim(total);
+  EmbeddingLookupKernel<<<dim.grid, dim.block>>>(weight.ptr, ids.ptr, out->ptr, num_ids, embedding_dim);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Elementwise and scalar operations
 ////////////////////////////////////////////////////////////////////////////////
@@ -685,6 +756,12 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
   m.def("ewise_log", EwiseLog);
   m.def("ewise_exp", EwiseExp);
   m.def("ewise_tanh", EwiseTanh);
+  m.def("ewise_sin", EwiseSin);
+  m.def("ewise_cos", EwiseCos);
+
+  m.def("arange", Arange);
+  m.def("triu_mask", TriuMask);
+  m.def("embedding_lookup", EmbeddingLookup);
 
   m.def("matmul", Matmul);
 
