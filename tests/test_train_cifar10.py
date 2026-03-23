@@ -108,7 +108,7 @@ def main():
         lr=args.lr, weight_decay=args.weight_decay
     )
     train_time = time.time() - t0
-    print(f"  Train done in {train_time:.1f}s — acc={train_acc:.4f}, loss={float(train_loss):.4f}")
+    print(f"  Train done in {train_time:.1f}s — acc={train_acc:.4f}, loss={train_loss.item():.4f}")
 
     # --- Evaluate (直接调用 simple_ml.evaluate_cifar10) ---
     print(f"\nStep 5: Evaluate on test set")
@@ -122,7 +122,7 @@ def main():
     print(f"  Total time : {train_time:.1f}s")
     print(f"  Train Acc  : {train_acc * 100:.2f}%")
     print(f"  Test  Acc  : {test_acc * 100:.2f}%")
-    print(f"  Test  Loss : {float(test_loss):.4f}")
+    print(f"  Test  Loss : {test_loss.item():.4f}")
     if test_acc > 0.60:
         print(f"  ✅ PASS — ResNet9 accuracy > 60%")
     elif test_acc > 0.40:

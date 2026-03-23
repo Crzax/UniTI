@@ -133,16 +133,16 @@ def main():
         device=device, dtype=DTYPE,
     )
     train_time = time.time() - t0
-    train_ppl = np.exp(float(train_loss))
+    train_ppl = np.exp(train_loss.item())
     print(f"  Train done in {train_time:.1f}s — "
-          f"loss={float(train_loss):.4f}, ppl={train_ppl:.1f}, acc={float(train_acc):.4f}")
+          f"loss={train_loss.item():.4f}, ppl={train_ppl:.1f}, acc={train_acc.item():.4f}")
 
     # --- Evaluate (直接调用 simple_ml.evaluate_ptb) ---
     print(f"\nStep 5: Evaluate on test set")
     test_acc, test_loss = evaluate_ptb(model, test_data,
                                        seq_len=args.seq_len,
                                        device=device, dtype=DTYPE)
-    test_ppl = np.exp(float(test_loss))
+    test_ppl = np.exp(test_loss.item())
 
     # --- Report ---
     print(f"\n{'=' * 60}")
@@ -150,9 +150,9 @@ def main():
     print(f"  Model       : {args.model.upper()}")
     print(f"  Device      : {device}")
     print(f"  Total time  : {train_time:.1f}s")
-    print(f"  Test Loss   : {float(test_loss):.4f}")
+    print(f"  Test Loss   : {test_loss.item():.4f}")
     print(f"  Test PPL    : {test_ppl:.1f}")
-    print(f"  Test Acc    : {float(test_acc) * 100:.2f}%")
+    print(f"  Test Acc    : {test_acc.item() * 100:.2f}%")
     if test_ppl < 500:
         print(f"  ✅ PASS — perplexity < 500 (model is learning)")
     else:

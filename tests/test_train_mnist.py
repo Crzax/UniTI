@@ -171,8 +171,8 @@ for epoch in range(1, N_EPOCHS + 1):
     test_h = compute_logits(X_test, W1, W2, device)
     test_loss, test_err = loss_err(test_h, y_test, device=device)
     print(f"  Epoch {epoch:2d}/{N_EPOCHS} | {dt:.1f}s | "
-          f"train loss={float(train_loss):.4f} err={float(train_err):.4f} | "
-          f"test  loss={float(test_loss):.4f}  err={float(test_err):.4f}")
+          f"train loss={train_loss.item():.4f} err={train_err.item():.4f} | "
+          f"test  loss={test_loss.item():.4f}  err={test_err.item():.4f}")
 
 total_time = time.time() - t_start
 
@@ -181,7 +181,7 @@ total_time = time.time() - t_start
 # ---------------------------------------------------------------------------
 final_h = compute_logits(X_test, W1, W2, device)
 _, final_test_err = loss_err(final_h, y_test, device=device)
-final_test_err = float(final_test_err)
+final_test_err = final_test_err.item()
 final_test_acc = 1.0 - final_test_err
 
 print(f"\n{'=' * 60}")

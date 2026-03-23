@@ -46,7 +46,7 @@ class SGD(Optimizer):
                 # (grad * grad).sum() gives a Tensor with one element
                 grad_sq_sum = (p.grad.detach() * p.grad.detach()).sum()
                 # Extract scalar via .numpy() on the reduced single-element tensor
-                total_norm_sq += float(grad_sq_sum.numpy())
+                total_norm_sq += grad_sq_sum.numpy().item()
         
         total_norm = total_norm_sq ** 0.5
         clip_coef = max_norm / (total_norm + 1e-6)
