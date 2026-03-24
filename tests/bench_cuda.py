@@ -74,7 +74,10 @@ bench(f"ewise_add ({N}x{N})", lambda: x_np + y_np, lambda: x_cu + y_cu)
 bench(f"ewise_mul ({N}x{N})", lambda: x_np * y_np, lambda: x_cu * y_cu)
 bench(f"ewise_div ({N}x{N})", lambda: x_np / y_np, lambda: x_cu / y_cu)
 bench(f"scalar_mul ({N}x{N})", lambda: x_np * 0.5, lambda: x_cu * 0.5)
-bench(f"scalar_power^0.5 ({N}x{N})", lambda: x_np ** 0.5, lambda: x_cu ** 0.5)
+# Use non-negative data for power^0.5 to avoid NaN from sqrt of negative numbers
+pos_raw = np.abs(big_raw)
+p_np = NDArray(pos_raw, device=dev_np); p_cu = NDArray(pos_raw, device=dev_cu)
+bench(f"scalar_power^0.5 ({N}x{N})", lambda: p_np ** 0.5, lambda: p_cu ** 0.5)
 bench(f"ewise_exp ({N}x{N})", lambda: x_np.exp(), lambda: x_cu.exp())
 
 # --- Reductions ---
@@ -103,7 +106,10 @@ print(f"\n=== Small tensor (decode-step-like) ops, shape=(1, {N}) ===\n")
 bench(f"ewise_add (1x{N})", lambda: sx_np + sy_np, lambda: sx_cu + sy_cu, 200)
 bench(f"ewise_mul (1x{N})", lambda: sx_np * sy_np, lambda: sx_cu * sy_cu, 200)
 bench(f"scalar_mul (1x{N})", lambda: sx_np * 0.5, lambda: sx_cu * 0.5, 200)
-bench(f"scalar_power^0.5 (1x{N})", lambda: sx_np ** 0.5, lambda: sx_cu ** 0.5, 200)
+# Use non-negative data for power^0.5
+sp_raw = np.abs(small)
+sp_np = NDArray(sp_raw, device=dev_np); sp_cu = NDArray(sp_raw, device=dev_cu)
+bench(f"scalar_power^0.5 (1x{N})", lambda: sp_np ** 0.5, lambda: sp_cu ** 0.5, 200)
 bench(f"ewise_exp (1x{N})", lambda: sx_np.exp(), lambda: sx_cu.exp(), 200)
 bench(f"reduce_sum (1x{N})", lambda: sx_np.sum(axis=1), lambda: sx_cu.sum(axis=1), 200)
 

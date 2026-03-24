@@ -16,6 +16,7 @@ from uniti.autograd import Tensor, no_grad
 from uniti.nn.paged_attention import PagedKVCacheManager
 from uniti.nn.nn_qwen2 import Qwen2Attention, Qwen2ForCausalLM
 from uniti.backend_selection import cpu_numpy
+from uniti.backend_ndarray.ndarray import NDArray
 
 np.random.seed(42)
 device = cpu_numpy()
@@ -64,7 +65,8 @@ def test_append_and_gather():
     # Append 3 tokens
     k1 = np.random.randn(num_kv_heads, 3, head_dim).astype(np.float32)
     v1 = np.random.randn(num_kv_heads, 3, head_dim).astype(np.float32)
-    mgr.append_kv(seq_id=0, layer_idx=0, k_data=k1, v_data=v1)
+    mgr.append_kv(seq_id=0, layer_idx=0,
+                  k_data=NDArray(k1, device=device), v_data=NDArray(v1, device=device))
     
     assert mgr.seq_lengths[0] == 3
     assert len(mgr.page_tables[0]) == 1  # 3 tokens fit in 1 block of size 4
@@ -78,7 +80,8 @@ def test_append_and_gather():
     # Append 3 more tokens (crosses block boundary: 3+3=6, needs 2 blocks)
     k2 = np.random.randn(num_kv_heads, 3, head_dim).astype(np.float32)
     v2 = np.random.randn(num_kv_heads, 3, head_dim).astype(np.float32)
-    mgr.append_kv(seq_id=0, layer_idx=0, k_data=k2, v_data=v2)
+    mgr.append_kv(seq_id=0, layer_idx=0,
+                  k_data=NDArray(k2, device=device), v_data=NDArray(v2, device=device))
     
     assert mgr.seq_lengths[0] == 6
     assert len(mgr.page_tables[0]) == 2  # 6 tokens need 2 blocks of size 4
@@ -113,7 +116,8 @@ def test_multi_layer():
         k = np.random.randn(num_kv_heads, 5, head_dim).astype(np.float32)
         v = np.random.randn(num_kv_heads, 5, head_dim).astype(np.float32)
         layer_data[layer_idx] = (k, v)
-        mgr.append_kv(seq_id=0, layer_idx=layer_idx, k_data=k, v_data=v)
+        mgr.append_kv(seq_id=0, layer_idx=layer_idx,
+                      k_data=NDArray(k, device=device), v_data=NDArray(v, device=device))
     
     # Verify each layer has its own data
     for layer_idx in range(num_layers):
@@ -146,7 +150,8 @@ def test_multi_sequence():
         k = np.random.randn(num_kv_heads, length, head_dim).astype(np.float32)
         v = np.random.randn(num_kv_heads, length, head_dim).astype(np.float32)
         seq_data[sid] = (k, v)
-        mgr.append_kv(seq_id=sid, layer_idx=0, k_data=k, v_data=v)
+        mgr.append_kv(seq_id=sid, layer_idx=0,
+                      k_data=NDArray(k, device=device), v_data=NDArray(v, device=device))
     
     # Verify each sequence
     for sid in range(3):
@@ -211,7 +216,8 @@ def test_gather_kv_tensor():
     
     k = np.random.randn(num_kv_heads, 5, head_dim).astype(np.float32)
     v = np.random.randn(num_kv_heads, 5, head_dim).astype(np.float32)
-    mgr.append_kv(seq_id=0, layer_idx=0, k_data=k, v_data=v)
+    mgr.append_kv(seq_id=0, layer_idx=0,
+                  k_data=NDArray(k, device=device), v_data=NDArray(v, device=device))
     
     k_t, v_t = mgr.gather_kv_tensor(seq_id=0, layer_idx=0)
     
@@ -237,7 +243,8 @@ def test_cache_stats():
     mgr.allocate_sequence(seq_id=0, initial_len=0)
     k = np.random.randn(4, 50, 64).astype(np.float32)
     v = np.random.randn(4, 50, 64).astype(np.float32)
-    mgr.append_kv(seq_id=0, layer_idx=0, k_data=k, v_data=v)
+    mgr.append_kv(seq_id=0, layer_idx=0,
+                  k_data=NDArray(k, device=device), v_data=NDArray(v, device=device))
     
     stats = mgr.get_cache_stats()
     assert stats["num_layers"] == 2
@@ -426,13 +433,15 @@ def test_block_boundary_crossing():
     # Append exactly block_size tokens
     k1 = np.random.randn(num_kv_heads, block_size, head_dim).astype(np.float32)
     v1 = np.random.randn(num_kv_heads, block_size, head_dim).astype(np.float32)
-    mgr.append_kv(seq_id=0, layer_idx=0, k_data=k1, v_data=v1)
+    mgr.append_kv(seq_id=0, layer_idx=0,
+                  k_data=NDArray(k1, device=device), v_data=NDArray(v1, device=device))
     assert len(mgr.page_tables[0]) == 1
     
     # Append 1 more token -> should allocate new block
     k2 = np.random.randn(num_kv_heads, 1, head_dim).astype(np.float32)
     v2 = np.random.randn(num_kv_heads, 1, head_dim).astype(np.float32)
-    mgr.append_kv(seq_id=0, layer_idx=0, k_data=k2, v_data=v2)
+    mgr.append_kv(seq_id=0, layer_idx=0,
+                  k_data=NDArray(k2, device=device), v_data=NDArray(v2, device=device))
     assert len(mgr.page_tables[0]) == 2
     
     # Verify all data

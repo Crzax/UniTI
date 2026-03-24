@@ -496,9 +496,12 @@ def test_memory_efficiency(verbose=False):
     )
     mgr.allocate_sequence(seq_id=0, initial_len=0)
 
+    from uniti.backend_ndarray.ndarray import NDArray as _NDArray
     for layer_idx in range(num_layers):
-        k = np.random.randn(num_kv_heads, actual_tokens, head_dim).astype(np.float32)
-        v = np.random.randn(num_kv_heads, actual_tokens, head_dim).astype(np.float32)
+        k_np = np.random.randn(num_kv_heads, actual_tokens, head_dim).astype(np.float32)
+        v_np = np.random.randn(num_kv_heads, actual_tokens, head_dim).astype(np.float32)
+        k = _NDArray(k_np, device=device)
+        v = _NDArray(v_np, device=device)
         mgr.append_kv(seq_id=0, layer_idx=layer_idx, k_data=k, v_data=v)
 
     stats = mgr.get_cache_stats()

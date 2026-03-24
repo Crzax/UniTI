@@ -263,6 +263,14 @@ class NDArray:
             )
             return out
 
+    def copy(self):
+        """Return a deep copy of this NDArray (always allocates new memory)."""
+        out = NDArray.make(self.shape, device=self.device)
+        self.device.compact(
+            self._handle, out._handle, self.shape, self.strides, self._offset
+        )
+        return out
+
     def as_strided(self, shape, strides):
         """Restride the matrix without copying memory."""
         assert len(shape) == len(strides)
