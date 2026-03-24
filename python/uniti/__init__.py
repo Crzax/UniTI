@@ -12,7 +12,7 @@ from .backend_selection import *
 import importlib as _importlib
 import sys as _sys
 
-_LAZY_SUBMODULES = {"data", "nn", "optim"}
+_LAZY_SUBMODULES = {"data", "nn", "optim", "safetensors_loader", "tokenizer"}
 _LOADING = set()            # re-entrance guard
 
 

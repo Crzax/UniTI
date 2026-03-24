@@ -2,11 +2,15 @@
 DeepSeek-R1-Distill-Qwen-1.5B inference using UniTi framework.
 Uses UniTi ops + no_grad() for training-inference unified pipeline.
 Supports both CPU and GPU backends.
+
+External dependencies: only numpy (no safetensors / torch / transformers needed).
+Weight loading and tokenization are handled by UniTi's own implementations.
 """
 import sys
 import os
 import json
 import time
+import codecs
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
@@ -15,6 +19,8 @@ import uniti
 from uniti.autograd import Tensor, no_grad
 from uniti.nn.nn_qwen2 import Qwen2ForCausalLM
 from uniti.backend_selection import cuda, cpu_numpy, cpu
+from uniti.safetensors_loader import load_safetensors, load_safetensors_sharded
+from uniti.tokenizer import UniTITokenizer
 
 
 def get_device(device_name: str):
@@ -30,22 +36,6 @@ def get_device(device_name: str):
         return cpu_numpy()
     else:
         raise ValueError(f"Unknown device: {device_name}")
-
-
-def load_safetensors(filepath):
-    """Load weights from safetensors as float32 numpy arrays."""
-    from safetensors import safe_open
-    import torch
-    tensors = {}
-    with safe_open(filepath, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            tensors[key] = f.get_tensor(key).to(torch.float32).numpy()
-    return tensors
-
-
-def load_tokenizer(model_path):
-    from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
 
 def load_weights_into_model(model: Qwen2ForCausalLM, state_dict: dict, device=None):
@@ -173,9 +163,27 @@ def generate(model, input_ids, tokenizer, max_new_tokens=100,
 
     generated = list(input_ids) + [next_tok]
     cur_pos = prompt_len
-    print(tokenizer.decode([next_tok]), end="", flush=True)
+
+    # Incremental UTF-8 decoder for streaming output.
+    # Byte-level BPE may split multi-byte chars (emoji) across tokens.
+    # The incremental decoder buffers incomplete byte sequences internally
+    # and only emits complete characters.
+    utf8_decoder = codecs.getincrementaldecoder('utf-8')('ignore')
+
+    def _stream_token(tok_id):
+        """Feed one token's raw bytes into the incremental decoder and print."""
+        raw = tokenizer.token_to_bytes(tok_id, skip_special_tokens=False)
+        text = utf8_decoder.decode(raw, False)
+        if text:
+            print(text, end="", flush=True)
+
+    _stream_token(next_tok)
 
     if next_tok == eos_token_id:
+        # Flush any buffered bytes
+        tail = utf8_decoder.decode(b'', True)
+        if tail:
+            print(tail, end="", flush=True)
         print()
         return generated
 
@@ -200,10 +208,15 @@ def generate(model, input_ids, tokenizer, max_new_tokens=100,
             next_tok = int(np.argmax(last_logits))
         generated.append(next_tok)
 
-        print(tokenizer.decode([next_tok]), end="", flush=True)
+        _stream_token(next_tok)
+
         if next_tok == eos_token_id:
             break
 
+    # Flush any remaining bytes in the incremental decoder
+    tail = utf8_decoder.decode(b'', True)
+    if tail:
+        print(tail, end="", flush=True)
     print()
     if decode_times:
         avg = np.mean(decode_times)
@@ -265,18 +278,18 @@ def main():
         dtype="float32",
     )
 
-    # Load weights to device
-    print("Loading weights...")
+    # Load weights to device (native loader, no safetensors/torch dependency)
+    print("Loading weights (UniTi native safetensors loader)...")
     t0 = time.time()
-    state_dict = load_safetensors(os.path.join(args.model_path, "model.safetensors"))
+    state_dict = load_safetensors_sharded(args.model_path)
     print(f"  {len(state_dict)} tensors in {time.time()-t0:.1f}s")
     load_weights_into_model(model, state_dict, device=device)
     del state_dict
     print(f"  Weights loaded to {args.device}")
 
-    # Tokenizer
-    print("Loading tokenizer...")
-    tokenizer = load_tokenizer(args.model_path)
+    # Tokenizer (UniTi native BPE tokenizer, no transformers dependency)
+    print("Loading tokenizer (UniTi native BPE tokenizer)...")
+    tokenizer = UniTITokenizer.from_pretrained(args.model_path)
 
     # Tokenize (apply chat template by default)
     if args.no_chat:
@@ -303,7 +316,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
-        eos_token_id=config.get("eos_token_id", 151643),
+        eos_token_id=config.get("eos_token_id", tokenizer.eos_token_id or 151643),
         do_sample=not args.greedy,
         use_paged_cache=args.paged,
         paged_block_size=args.block_size,
