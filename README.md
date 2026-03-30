@@ -11,6 +11,7 @@
 | 🔄 **训推一体架构** | 训练和推理共享同一套算子与模型代码，通过 `no_grad()` / `detach` 机制无缝切换 |
 | 🧠 **多种模型支持** | 两层全连接网络、ResNet9、RNN / LSTM / Transformer 语言模型、Qwen2 大语言模型 |
 | 📄 **Paged Attention** | vLLM 风格分页式 KV Cache，按需分配物理块，避免连续预分配的内存浪费 |
+| 🚀 **Batch Inference** | 多序列并行推理，不同 prompt 长度自动对齐，共享物理块池，EOS 独立终止 |
 | ⚡ **推理优化** | `no_grad()` 跳过计算图构建、`last_only` 仅计算末位 logits、KV Cache 增量解码 |
 | 📦 **零外部依赖推理** | 自研 safetensors 加载器 + BPE Tokenizer，推理仅需 `numpy`，无需 torch / transformers |
 | 🔤 **流式 UTF-8 解码** | 基于 `codecs.IncrementalDecoder` 的字节级增量解码，正确流式输出 emoji 等多字节字符 |
@@ -234,6 +235,8 @@ python tests/test_train_ptb.py --device cuda --model lstm --epochs 3 \
 
 ### DeepSeek-R1-Distill-Qwen-1.5B
 
+#### 单序列推理
+
 ```bash
 # 基本推理（cpu_numpy 后端，连续 KV Cache）
 python apps/deepseek_inference.py \
@@ -254,21 +257,42 @@ python apps/deepseek_inference.py \
     --device cpu --greedy
 ```
 
+#### Batch 推理（多序列并行）
+
+```bash
+# 基本 batch 推理（自动启用 Paged Attention）
+python apps/deepseek_inference.py --batch \
+    --batch_prompts "What is 2+2?" "Hello!" "Explain gravity in one sentence." \
+    --device cuda --greedy --max_new_tokens 200
+
+# batch 推理 + 自定义块参数
+python apps/deepseek_inference.py --batch \
+    --batch_prompts "Tell me a joke" "Who is Einstein?" \
+    --device cuda --max_new_tokens 300 --block_size 16 --max_blocks 512
+
+# batch 推理 + 跳过 chat template
+python apps/deepseek_inference.py --batch --no_chat \
+    --batch_prompts "Once upon a time" "The meaning of life is" \
+    --device cuda --greedy
+```
+
 **参数说明**：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--model_path` | - | HuggingFace 格式模型路径 |
-| `--prompt` | "Hello, how are you?" | 输入文本 |
+| `--prompt` | "Hello, how are you?" | 输入文本（单序列模式） |
 | `--device` | cpu_numpy | 计算后端：`cpu` / `cpu_numpy` / `cuda` |
 | `--max_new_tokens` | 1000 | 最大生成 token 数 |
 | `--temperature` | 0.6 | 采样温度 |
 | `--top_p` | 0.95 | Top-p 采样阈值 |
 | `--greedy` | False | 贪心解码（不采样） |
-| `--paged` | False | 启用 Paged Attention |
+| `--paged` | False | 启用 Paged Attention（单序列模式） |
 | `--block_size` | 16 | Page 大小（tokens/page） |
 | `--max_blocks` | 256 | 最大物理块数 |
 | `--no_chat` | False | 跳过 Chat Template |
+| `--batch` | False | 启用 Batch 推理模式（自动开启 Paged Attention） |
+| `--batch_prompts` | - | 多个 prompt（空格分隔，每个用引号括起） |
 
 ---
 
@@ -278,6 +302,8 @@ python apps/deepseek_inference.py \
 # 功能测试
 python tests/test_paged_attention.py          # Paged Attention 单元测试
 python tests/test_paged_vs_contiguous.py      # Paged vs Contiguous KV Cache 对比
+python tests/test_batch_inference.py          # Batch Inference 完整测试（8 项）
+python tests/test_batch_inference.py -v --real-model  # 含真实模型的 Batch 推理验证
 python tests/test_full_cpu.py                 # CPU 后端完整功能测试
 
 # 性能基准
