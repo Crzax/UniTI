@@ -654,7 +654,7 @@ def format_report(contig_result, paged_result, config, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Paged vs Contiguous KV Cache Benchmark")
-    parser.add_argument("--model_path", default="/home/iclab/LLM_ndl/llaisys/models/DeepSeek-R1-Distill-Qwen-1.5B")
+    parser.add_argument("--model_path", default="")
     parser.add_argument("--prompt", default="Please explain what is PagedAttention in vLLM and how it improves memory efficiency for large language model serving.")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu", "cpu_numpy"])

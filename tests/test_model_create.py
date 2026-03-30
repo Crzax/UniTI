@@ -12,7 +12,7 @@ device = cpu_numpy()
 print(f'Device: {device}')
 
 # Load config
-model_path = "/home/iclab/LLM_ndl/llaisys/models/DeepSeek-R1-Distill-Qwen-1.5B"
+model_path = ""
 with open(f"{model_path}/config.json") as f:
     config = json.load(f)
 print(f"Creating model with {config['num_hidden_layers']} layers...")

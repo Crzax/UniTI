@@ -8,7 +8,7 @@ Supports all backends (cpu/cuda/cpu_numpy) via UniTi's unified NDArray API.
 All computation uses UniTi Tensor and ops.
 All data stays on native device — no cross-backend fallbacks.
 """
-from typing import Optional
+from typing import Optional, List, Union
 from uniti.autograd import Tensor
 from uniti import ops
 import uniti.init as init
@@ -205,13 +205,15 @@ class Qwen2Attention(Module):
         self._v_cache = self.device.full(shape, 0.0)
         self._cache_len = 0
 
-    def set_paged_cache(self, cache_mgr: 'PagedKVCacheManager', layer_idx: int, seq_id: int = 0):
+    def set_paged_cache(self, cache_mgr: 'PagedKVCacheManager', layer_idx: int,
+                        seq_id: Union[int, List[int]] = 0):
         """Attach a paged KV cache manager to this attention layer.
         
         Args:
             cache_mgr: The shared PagedKVCacheManager instance.
             layer_idx: This layer's index (used to index into cache_mgr's per-layer blocks).
-            seq_id: The sequence ID to use for cache operations.
+            seq_id: The sequence ID(s) to use for cache operations.
+                    Can be a single int (backward compat) or list of ints for batch mode.
         """
         # Clear contiguous cache if switching modes
         self._k_cache = None
@@ -221,7 +223,13 @@ class Qwen2Attention(Module):
         
         self._paged_cache_mgr = cache_mgr
         self._paged_layer_idx = layer_idx
-        self._paged_seq_id = seq_id
+        # Store seq_ids as a list for batch support
+        if isinstance(seq_id, int):
+            self._paged_seq_ids = [seq_id]
+        else:
+            self._paged_seq_ids = list(seq_id)
+        # Keep backward compat attribute
+        self._paged_seq_id = self._paged_seq_ids[0]
 
     def reset_cache(self):
         """Reset all cache state (both contiguous and paged)."""
@@ -256,13 +264,23 @@ class Qwen2Attention(Module):
         x = x.reshape((bs, kv_heads * n_rep, seq_len, head_dim))
         return x
 
-    def forward(self, x: Tensor, start_pos: int = 0) -> Tensor:
+    def forward(self, x: Tensor, start_pos: Union[int, List[int]] = 0) -> Tensor:
         """
         x: (batch_size, seq_len, hidden_size)
-        start_pos: position offset for KV cache (0 = no cache / training mode)
+        start_pos: position offset for KV cache. Can be:
+          - int: same offset for all batch elements (legacy, single-sequence)
+          - List[int]: per-sequence offset for batch paged attention
         Returns: (batch_size, seq_len, hidden_size)
         """
         batch_size, seq_length, _ = x.shape
+
+        # Normalize start_pos to a list
+        if isinstance(start_pos, int):
+            start_pos_list = [start_pos] * batch_size
+        else:
+            start_pos_list = list(start_pos)
+            assert len(start_pos_list) == batch_size, \
+                f"start_pos list length ({len(start_pos_list)}) != batch_size ({batch_size})"
 
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -273,78 +291,124 @@ class Qwen2Attention(Module):
         k = k.reshape((batch_size, seq_length, self.num_kv_heads, self.head_dim)).transpose(axes=(1, 2))
         v = v.reshape((batch_size, seq_length, self.num_kv_heads, self.head_dim)).transpose(axes=(1, 2))
 
-        # RoPE — slice precomputed cos/sin NDArray and wrap as Tensor
-        cos_nd = self._cos_cache[start_pos:start_pos + seq_length, :]
-        sin_nd = self._sin_cache[start_pos:start_pos + seq_length, :]
-        cos_t = Tensor.make_const(cos_nd, requires_grad=False)
-        sin_t = Tensor.make_const(sin_nd, requires_grad=False)
+        # Check if all start_pos are the same (can use fast path for RoPE)
+        all_same_pos = all(sp == start_pos_list[0] for sp in start_pos_list)
 
-        q = apply_rotary_emb(q, cos_t, sin_t)
-        k = apply_rotary_emb(k, cos_t, sin_t)
+        if all_same_pos:
+            # Fast path: same RoPE for all batch elements
+            sp = start_pos_list[0]
+            cos_nd = self._cos_cache[sp:sp + seq_length, :]
+            sin_nd = self._sin_cache[sp:sp + seq_length, :]
+            cos_t = Tensor.make_const(cos_nd, requires_grad=False)
+            sin_t = Tensor.make_const(sin_nd, requires_grad=False)
+            q = apply_rotary_emb(q, cos_t, sin_t)
+            k = apply_rotary_emb(k, cos_t, sin_t)
+        else:
+            # Per-sequence RoPE: apply separately to each batch element
+            # This happens during batch decode when sequences have different lengths
+            q_nd = q.realize_cached_data()
+            k_nd = k.realize_cached_data()
+
+            for b in range(batch_size):
+                sp = start_pos_list[b]
+                cos_nd = self._cos_cache[sp:sp + seq_length, :]
+                sin_nd = self._sin_cache[sp:sp + seq_length, :]
+                cos_t = Tensor.make_const(cos_nd, requires_grad=False)
+                sin_t = Tensor.make_const(sin_nd, requires_grad=False)
+
+                # Slice batch element: (1, heads, seq, hd)
+                q_b = Tensor.make_const(
+                    q_nd[b:b+1, :, :, :].compact(), requires_grad=False)
+                k_b = Tensor.make_const(
+                    k_nd[b:b+1, :, :, :].compact(), requires_grad=False)
+
+                q_b = apply_rotary_emb(q_b, cos_t, sin_t)
+                k_b = apply_rotary_emb(k_b, cos_t, sin_t)
+
+                q_nd[b:b+1, :, :, :] = q_b.realize_cached_data()
+                k_nd[b:b+1, :, :, :] = k_b.realize_cached_data()
+
+            q = Tensor.make_const(q_nd, requires_grad=False)
+            k = Tensor.make_const(k_nd, requires_grad=False)
 
         # KV Cache handling — choose between paged and contiguous modes
-        end_pos = start_pos + seq_length
-        
         if self._paged_cache_mgr is not None:
             # ====== PAGED ATTENTION MODE ======
             # Device-unified: all backends use NDArray through realize_cached_data()
-            
+            k_nd_full = k.realize_cached_data()
+            v_nd_full = v.realize_cached_data()
+
             for b in range(batch_size):
-                # Get NDArray directly from Tensor — works on all backends (cpu/cuda/cpu_numpy)
-                k_nd = k.realize_cached_data()  # NDArray: (batch, num_kv_heads, seq_length, head_dim)
-                v_nd = v.realize_cached_data()
-                # Slice out this batch element: (1, num_kv_heads, seq_length, head_dim) -> compact -> reshape
-                k_b = k_nd[b:b+1, :, :, :].compact().reshape(
+                # Determine which seq_id to use for this batch element
+                if b < len(self._paged_seq_ids):
+                    sid = self._paged_seq_ids[b]
+                else:
+                    sid = self._paged_seq_id + b
+                # Slice out this batch element
+                k_b = k_nd_full[b:b+1, :, :, :].compact().reshape(
                     (self.num_kv_heads, seq_length, self.head_dim))
-                v_b = v_nd[b:b+1, :, :, :].compact().reshape(
+                v_b = v_nd_full[b:b+1, :, :, :].compact().reshape(
                     (self.num_kv_heads, seq_length, self.head_dim))
                 # append_kv accepts NDArray directly — stays on native device
                 self._paged_cache_mgr.append_kv(
-                    seq_id=self._paged_seq_id + b,
+                    seq_id=sid,
                     layer_idx=self._paged_layer_idx,
                     k_data=k_b,
                     v_data=v_b,
                 )
-            
+
             # Gather full KV cache from paged blocks
             if batch_size == 1:
                 k, v = self._paged_cache_mgr.gather_kv_tensor(
-                    seq_id=self._paged_seq_id,
+                    seq_id=self._paged_seq_ids[0],
                     layer_idx=self._paged_layer_idx,
                 )
+                total_len = k.shape[2]
             else:
-                # Batch mode: gather per sequence as NDArray, concatenate via NDArray, wrap as Tensor
+                # Batch mode: gather per sequence, pad to max length, build batched tensor
                 k_list, v_list = [], []
+                seq_lens = []
                 for b in range(batch_size):
+                    if b < len(self._paged_seq_ids):
+                        sid = self._paged_seq_ids[b]
+                    else:
+                        sid = self._paged_seq_id + b
                     k_b, v_b = self._paged_cache_mgr.gather_kv_as_ndarray(
-                        seq_id=self._paged_seq_id + b,
+                        seq_id=sid,
                         layer_idx=self._paged_layer_idx,
                     )
                     k_list.append(k_b)
                     v_list.append(v_b)
-                # Concatenate NDArrays along batch dim (axis=0) using device.full + slice assignment
-                total_len = k_list[0].shape[1]  # seq dim
-                k_shape = (batch_size, self.num_kv_heads, total_len, self.head_dim)
+                    seq_lens.append(k_b.shape[2])  # (1, kv_heads, seq_len, hd)
+
+                # Pad all sequences to max length
+                max_kv_len = max(seq_lens)
+                total_len = max_kv_len
+                k_shape = (batch_size, self.num_kv_heads, max_kv_len, self.head_dim)
                 v_shape = k_shape
                 k_concat = self.device.full(k_shape, 0.0)
                 v_concat = self.device.full(v_shape, 0.0)
                 for b in range(batch_size):
-                    k_concat[b:b+1, :, :, :] = k_list[b]
-                    v_concat[b:b+1, :, :, :] = v_list[b]
+                    sl = seq_lens[b]
+                    k_concat[b:b+1, :, :sl, :] = k_list[b]
+                    v_concat[b:b+1, :, :sl, :] = v_list[b]
                 k = Tensor.make_const(k_concat, requires_grad=False)
                 v = Tensor.make_const(v_concat, requires_grad=False)
 
         elif self._k_cache is not None and self._v_cache is not None:
             # ====== CONTIGUOUS CACHE MODE (unified NDArray for all backends) ======
+            sp = start_pos_list[0]  # contiguous mode uses same start_pos
+            end_pos = sp + seq_length
             k_nd = k.realize_cached_data()
             v_nd = v.realize_cached_data()
-            self._k_cache[:, :, start_pos:end_pos, :] = k_nd
-            self._v_cache[:, :, start_pos:end_pos, :] = v_nd
+            self._k_cache[:, :, sp:end_pos, :] = k_nd
+            self._v_cache[:, :, sp:end_pos, :] = v_nd
             self._cache_len = end_pos
             k = Tensor.make_const(self._k_cache[:, :, :end_pos, :], requires_grad=False)
             v = Tensor.make_const(self._v_cache[:, :, :end_pos, :], requires_grad=False)
-
-        total_len = k.shape[2]
+            total_len = end_pos
+        else:
+            total_len = k.shape[2]
 
         # GQA: repeat k, v
         k = self._repeat_kv(k, self.num_kv_groups)
@@ -361,6 +425,24 @@ class Qwen2Attention(Module):
             mask_t = Tensor.make_const(mask_nd, requires_grad=False)
             mask_t = mask_t.reshape((1, 1, seq_length, total_len)).broadcast_to(attn_weights.shape)
             attn_weights = attn_weights + mask_t
+        elif batch_size > 1 and self._paged_cache_mgr is not None:
+            # Decode step in batch mode: different sequences may have different lengths
+            # Apply per-sequence masking to zero out padding in KV cache
+            # For decode (seq_length=1), we need to mask padded positions
+            # attn_weights shape: (batch, heads, 1, total_len)
+            # We need a mask where positions beyond each seq's length are -inf
+            has_diff_lens = not all(sl == seq_lens[0] for sl in seq_lens) if batch_size > 1 else False
+            if has_diff_lens:
+                import numpy as _np
+                mask_np = _np.zeros((batch_size, 1, 1, total_len), dtype=_np.float32)
+                for b in range(batch_size):
+                    if seq_lens[b] < total_len:
+                        mask_np[b, 0, 0, seq_lens[b]:] = -1e9
+                from uniti.backend_ndarray.ndarray import NDArray as _NDArray
+                mask_nd = _NDArray(mask_np, device=self.device)
+                mask_t = Tensor.make_const(mask_nd, requires_grad=False)
+                mask_t = mask_t.broadcast_to(attn_weights.shape)
+                attn_weights = attn_weights + mask_t
 
         attn_weights = self._softmax(attn_weights)
 
@@ -426,7 +508,7 @@ class Qwen2DecoderLayer(Module):
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
 
-    def forward(self, x: Tensor, start_pos: int = 0) -> Tensor:
+    def forward(self, x: Tensor, start_pos: Union[int, List[int]] = 0) -> Tensor:
         # Pre-norm attention with residual
         residual = x
         x = self.input_layernorm(x)
@@ -540,8 +622,8 @@ class Qwen2Model(Module):
         self,
         block_size: int = 16,
         max_num_blocks: int = 256,
-        seq_id: int = 0,
-        initial_len: int = 0,
+        seq_id: Union[int, List[int]] = 0,
+        initial_len: Union[int, List[int]] = 0,
     ) -> PagedKVCacheManager:
         """Initialize paged KV cache for all attention layers.
         
@@ -550,8 +632,9 @@ class Qwen2Model(Module):
         Args:
             block_size: Number of tokens per page/block.
             max_num_blocks: Maximum number of physical blocks in the pool.
-            seq_id: Sequence ID to allocate.
-            initial_len: Pre-allocate blocks for this many tokens.
+            seq_id: Sequence ID(s) to allocate. int for single, list for batch.
+            initial_len: Pre-allocate blocks for this many tokens per sequence.
+                         int (applied to all) or list (per-sequence).
             
         Returns:
             The created PagedKVCacheManager for external inspection/control.
@@ -566,28 +649,57 @@ class Qwen2Model(Module):
             dtype=self.dtype,
         )
         
-        # Allocate sequence
-        cache_mgr.allocate_sequence(seq_id, initial_len=initial_len)
+        # Normalize seq_id and initial_len to lists
+        if isinstance(seq_id, int):
+            seq_ids = [seq_id]
+        else:
+            seq_ids = list(seq_id)
         
-        # Attach to all layers
+        if isinstance(initial_len, int):
+            initial_lens = [initial_len] * len(seq_ids)
+        else:
+            initial_lens = list(initial_len)
+            assert len(initial_lens) == len(seq_ids)
+        
+        # Allocate all sequences
+        for sid, ilen in zip(seq_ids, initial_lens):
+            cache_mgr.allocate_sequence(sid, initial_len=ilen)
+        
+        # Attach to all layers with the list of seq_ids
         for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.set_paged_cache(cache_mgr, layer_idx, seq_id)
+            layer.self_attn.set_paged_cache(cache_mgr, layer_idx, seq_ids)
         
         self._paged_cache_mgr = cache_mgr
         return cache_mgr
 
     def reset_cache(self):
-        """Reset all caches (both contiguous and paged)."""
+        """Reset all caches (both contiguous and paged).
+        
+        Release order matters for memory efficiency:
+        1. Free all sequences in the paged manager (returns block indices to pool)
+        2. Reset each attention layer's cache references (drops NDArray refs)
+        3. Reset/drop the paged manager itself (old block pool becomes unreferenced)
+        
+        After this, Python GC can reclaim the underlying NDArray memory
+        (cudaFree / free). The caller should invoke gc.collect() if immediate
+        reclamation is desired.
+        """
+        # Step 1: Free sequence allocations first (logical release of blocks)
+        if self._paged_cache_mgr is not None:
+            self._paged_cache_mgr.free_all_sequences()
+        
+        # Step 2: Drop all per-layer cache references
         for layer in self.layers:
             layer.self_attn.reset_cache()
+        
+        # Step 3: Drop the manager itself (and its block pool NDArrays)
         if self._paged_cache_mgr is not None:
-            self._paged_cache_mgr.reset()
             self._paged_cache_mgr = None
 
-    def forward(self, input_ids_tensor: Tensor, start_pos: int = 0) -> Tensor:
+    def forward(self, input_ids_tensor: Tensor, start_pos: Union[int, List[int]] = 0) -> Tensor:
         """
         input_ids_tensor: (batch_size, seq_len) float tensor of token IDs
-        start_pos: position offset for KV cache
+        start_pos: position offset for KV cache (int or list of int for batch)
         Returns: (batch_size, seq_len, hidden_size)
         """
         x = self.embed_tokens(input_ids_tensor)
@@ -650,8 +762,8 @@ class Qwen2ForCausalLM(Module):
         self,
         block_size: int = 16,
         max_num_blocks: int = 256,
-        seq_id: int = 0,
-        initial_len: int = 0,
+        seq_id: Union[int, List[int]] = 0,
+        initial_len: Union[int, List[int]] = 0,
     ) -> 'PagedKVCacheManager':
         """Initialize paged KV cache for all attention layers.
         
@@ -662,7 +774,7 @@ class Qwen2ForCausalLM(Module):
         Args:
             block_size: Number of tokens per page/block (default: 16).
             max_num_blocks: Maximum number of physical blocks in the pool.
-            seq_id: Sequence ID to allocate.
+            seq_id: Sequence ID(s) to allocate. int for single, list for batch.
             initial_len: Pre-allocate blocks for this many tokens.
             
         Returns:
@@ -679,10 +791,11 @@ class Qwen2ForCausalLM(Module):
         """Reset all caches."""
         self.model.reset_cache()
 
-    def forward(self, input_ids_tensor: Tensor, start_pos: int = 0, last_only: bool = False) -> Tensor:
+    def forward(self, input_ids_tensor: Tensor, start_pos: Union[int, List[int]] = 0,
+                last_only: bool = False) -> Tensor:
         """
         input_ids_tensor: (batch_size, seq_len)
-        start_pos: position offset for KV cache
+        start_pos: position offset for KV cache (int or list of int for batch)
         last_only: if True, only compute lm_head for the last token (decode optimization)
         Returns: logits (batch_size, seq_len or 1, vocab_size)
         """

@@ -354,6 +354,58 @@ class PagedKVCacheManager:
         v_tensor = Tensor.make_const(v_nd, requires_grad=False)
         return k_tensor, v_tensor
 
+    def free_completed_sequences(self, completed_seq_ids: list):
+        """Free blocks for a batch of completed sequences.
+        
+        Call this during batch inference when some sequences have finished
+        generating (hit EOS) to immediately reclaim their blocks for other
+        sequences or future allocations.
+        
+        Args:
+            completed_seq_ids: List of sequence IDs that are done generating.
+        
+        Returns:
+            Number of blocks freed.
+        """
+        freed = 0
+        for seq_id in completed_seq_ids:
+            if seq_id in self.page_tables:
+                freed += len(self.page_tables[seq_id])
+                self.free_sequence(seq_id)
+        return freed
+
+    def free_all_sequences(self):
+        """Free all allocated sequences and return their blocks to the pool.
+        
+        Unlike reset(), this does NOT re-allocate the block pool — the existing
+        physical blocks are kept as-is (just logically freed). This is cheaper
+        than reset() when you plan to reuse the cache manager.
+        
+        Returns:
+            Number of blocks freed.
+        """
+        freed = 0
+        for seq_id in list(self.page_tables.keys()):
+            freed += len(self.page_tables[seq_id])
+            self.free_sequence(seq_id)
+        return freed
+
+    @property
+    def memory_footprint_bytes(self) -> int:
+        """Estimate total memory used by the physical block pool (K+V, all layers).
+        
+        This is the *allocated* memory (not just in-use blocks), since the
+        entire pool is pre-allocated at init time.
+        
+        Returns:
+            Approximate memory in bytes (assuming float32 = 4 bytes per element).
+        """
+        elements_per_layer = (
+            self.max_num_blocks * self.num_kv_heads * self.block_size * self.head_dim
+        )
+        # K + V = 2 arrays per layer, float32 = 4 bytes
+        return elements_per_layer * 2 * self.num_layers * 4
+
     def reset(self):
         """Reset all allocations — free all sequences and blocks."""
         # Free all sequences

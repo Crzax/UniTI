@@ -11,6 +11,7 @@ import os
 import json
 import time
 import codecs
+import gc
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
@@ -115,6 +116,32 @@ def top_p_sampling(logits_np, temperature=0.6, top_p=0.95):
     return int(np.random.choice(idx, p=probs_f))
 
 
+def _release_cache(model, use_paged_cache, cache_mgr=None):
+    """Proactively release KV cache memory after generation completes.
+    
+    Without this, KV cache blocks remain allocated in GPU/CPU memory until
+    the next generate() call invokes model.reset_cache(). This can be
+    problematic in interactive settings where idle time between calls is long.
+    
+    For Paged Attention: frees all sequence page-table entries (logical release),
+    which allows the blocks to be reused immediately.
+    
+    For Contiguous cache: sets cache NDArrays to None so Python GC can
+    reclaim the underlying memory (cudaFree / free).
+    
+    Calls gc.collect() to ensure prompt reclamation of cyclic references.
+    """
+    if use_paged_cache and cache_mgr is not None:
+        freed = cache_mgr.free_all_sequences()
+        if freed > 0:
+            print(f"  [Memory] Released {freed} paged blocks "
+                  f"(~{cache_mgr.memory_footprint_bytes / 1024 / 1024:.1f} MB pool)")
+    # Reset model-level cache references (sets NDArray refs to None)
+    model.reset_cache()
+    # Force GC to reclaim any cyclic references promptly
+    gc.collect()
+
+
 def generate(model, input_ids, tokenizer, max_new_tokens=100,
              temperature=0.6, top_p=0.95, eos_token_id=151643, do_sample=True,
              use_paged_cache=False, paged_block_size=16, paged_max_blocks=256):
@@ -185,6 +212,8 @@ def generate(model, input_ids, tokenizer, max_new_tokens=100,
         if tail:
             print(tail, end="", flush=True)
         print()
+        # Proactively release KV cache after generation completes
+        _release_cache(model, use_paged_cache, cache_mgr if use_paged_cache else None)
         return generated
 
     decode_times = []
@@ -227,13 +256,163 @@ def generate(model, input_ids, tokenizer, max_new_tokens=100,
         print(f"  [Paged] Final: {stats['num_used_blocks']}/{stats['max_num_blocks']} blocks "
               f"({stats['utilization']:.1f}% used)")
     
+    # Proactively release KV cache after generation completes
+    _release_cache(model, use_paged_cache, cache_mgr if use_paged_cache else None)
+    return generated
+
+
+def generate_batch(model, batch_input_ids, tokenizer, max_new_tokens=100,
+                   temperature=0.6, top_p=0.95, eos_token_id=151643, do_sample=True,
+                   paged_block_size=16, paged_max_blocks=512):
+    """Batch inference using Paged Attention.
+    
+    Each sequence in the batch can have a different prompt length.
+    Sequences that reach EOS stop generating but stay in the batch
+    (padded) until all sequences are done.
+    
+    Args:
+        model: Qwen2ForCausalLM model.
+        batch_input_ids: List of token ID lists (one per sequence).
+        tokenizer: UniTITokenizer instance.
+        max_new_tokens: Maximum number of tokens to generate per sequence.
+        temperature: Sampling temperature.
+        top_p: Top-p sampling threshold.
+        eos_token_id: End-of-sequence token ID.
+        do_sample: If True, use top-p sampling; else greedy.
+        paged_block_size: Block size for Paged Attention.
+        paged_max_blocks: Maximum number of physical blocks.
+        
+    Returns:
+        List of generated token ID lists (one per sequence, including prompt).
+    """
+    model.reset_cache()
+    model.eval()
+    
+    batch_size = len(batch_input_ids)
+    prompt_lens = [len(ids) for ids in batch_input_ids]
+    
+    print(f"  [Batch Paged Attention] batch_size={batch_size}, "
+          f"block_size={paged_block_size}, max_blocks={paged_max_blocks}")
+    print(f"  Prompt lengths: {prompt_lens}")
+    
+    # Initialize paged cache for all sequences
+    seq_ids = list(range(batch_size))
+    cache_mgr = model.init_paged_cache(
+        block_size=paged_block_size,
+        max_num_blocks=paged_max_blocks,
+        seq_id=seq_ids,
+        initial_len=0,
+    )
+    
+    # === Phase 1: Prefill each sequence individually ===
+    # (Different prompt lengths require separate prefill passes)
+    t0 = time.time()
+    first_logits = []
+    
+    with no_grad():
+        for b in range(batch_size):
+            prompt = batch_input_ids[b]
+            pl = len(prompt)
+            ids_np = np.array([prompt], dtype=np.float32)  # (1, prompt_len)
+            
+            # Temporarily set the attention layers to only use this sequence's ID
+            for layer in model.model.layers:
+                layer.self_attn._paged_seq_ids = [seq_ids[b]]
+                layer.self_attn._paged_seq_id = seq_ids[b]
+            
+            ids_tensor = Tensor(ids_np, device=model.device, dtype=model.dtype, requires_grad=False)
+            logits = model(ids_tensor, start_pos=0, last_only=True)
+            logits_np = logits.realize_cached_data().numpy()
+            first_logits.append(logits_np[0, -1, :])
+    
+    prefill_t = time.time() - t0
+    total_prefill_toks = sum(prompt_lens)
+    print(f"  Prefill {batch_size} sequences ({total_prefill_toks} total tokens) "
+          f"in {prefill_t:.2f}s ({total_prefill_toks / max(prefill_t, 1e-9):.1f} tok/s)")
+    
+    # Restore the full seq_ids list for batch decode
+    for layer in model.model.layers:
+        layer.self_attn._paged_seq_ids = seq_ids
+        layer.self_attn._paged_seq_id = seq_ids[0]
+    
+    # Sample first tokens
+    next_toks = []
+    for b in range(batch_size):
+        if do_sample and temperature > 0:
+            tok = top_p_sampling(first_logits[b], temperature, top_p)
+        else:
+            tok = int(np.argmax(first_logits[b]))
+        next_toks.append(tok)
+    
+    # Initialize generated sequences and tracking
+    generated = [list(batch_input_ids[b]) + [next_toks[b]] for b in range(batch_size)]
+    cur_pos = list(prompt_lens)  # per-sequence position
+    finished = [next_toks[b] == eos_token_id for b in range(batch_size)]
+    
+    stats = cache_mgr.get_cache_stats()
+    print(f"  [Paged] After prefill: {stats['num_used_blocks']}/{stats['max_num_blocks']} blocks "
+          f"({stats['utilization']:.1f}% used)")
+    
+    # === Phase 2: Batch decode ===
+    decode_times = []
+    
+    for step in range(1, max_new_tokens):
+        if all(finished):
+            break
+        
+        t0 = time.time()
+        with no_grad():
+            # Build batch input: (batch_size, 1)
+            tok_np = np.array([[next_toks[b]] for b in range(batch_size)], dtype=np.float32)
+            tok_tensor = Tensor(
+                tok_np, device=model.device, dtype=model.dtype, requires_grad=False
+            )
+            logits = model(tok_tensor, start_pos=cur_pos, last_only=True)
+            logits_np = logits.realize_cached_data().numpy()
+        
+        dt = time.time() - t0
+        decode_times.append(dt)
+        
+        # Sample next tokens
+        for b in range(batch_size):
+            if finished[b]:
+                continue
+            cur_pos[b] += 1
+            last_logits = logits_np[b, -1, :]
+            if do_sample and temperature > 0:
+                next_tok = top_p_sampling(last_logits, temperature, top_p)
+            else:
+                next_tok = int(np.argmax(last_logits))
+            next_toks[b] = next_tok
+            generated[b].append(next_tok)
+            if next_tok == eos_token_id:
+                finished[b] = True
+                print(f"  [EOS] Seq {b} finished at step {step}")
+    
+    # Print stats
+    if decode_times:
+        avg = np.mean(decode_times)
+        print(f"  Decode: {len(decode_times)} steps, avg {avg:.3f}s/step "
+              f"({batch_size/avg:.2f} effective tok/s for batch_size={batch_size})")
+    
+    stats = cache_mgr.get_cache_stats()
+    print(f"  [Paged] Final: {stats['num_used_blocks']}/{stats['max_num_blocks']} blocks "
+          f"({stats['utilization']:.1f}% used)")
+    
+    for b in range(batch_size):
+        gen_len = len(generated[b]) - prompt_lens[b]
+        print(f"  Seq {b}: prompt={prompt_lens[b]}, generated={gen_len}, "
+              f"finished={'yes' if finished[b] else 'no'}")
+    
+    # Proactively release all remaining KV cache after batch generation completes
+    _release_cache(model, True, cache_mgr)
     return generated
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", default="/home/iclab/LLM_ndl/llaisys/models/DeepSeek-R1-Distill-Qwen-1.5B")
+    parser.add_argument("--model_path", default="")
     parser.add_argument("--prompt", default="Hello, how are you?")
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -248,6 +427,10 @@ def main():
                         help="Block size for Paged Attention (tokens per page)")
     parser.add_argument("--max_blocks", type=int, default=256,
                         help="Maximum number of physical blocks for Paged Attention")
+    parser.add_argument("--batch", action="store_true",
+                        help="Enable batch inference mode (uses Paged Attention)")
+    parser.add_argument("--batch_prompts", nargs="+", default=None,
+                        help="Multiple prompts for batch inference (one per sequence)")
     args = parser.parse_args()
 
     # Get device
@@ -291,44 +474,95 @@ def main():
     print("Loading tokenizer (UniTi native BPE tokenizer)...")
     tokenizer = UniTITokenizer.from_pretrained(args.model_path)
 
-    # Tokenize (apply chat template by default)
-    if args.no_chat:
-        input_ids = tokenizer.encode(args.prompt)
+    eos_token_id = config.get("eos_token_id", tokenizer.eos_token_id or 151643)
+
+    if args.batch:
+        # === Batch Inference Mode ===
+        prompts = args.batch_prompts or [
+            args.prompt,
+            "What is deep learning?",
+            "Tell me a joke.",
+        ]
+        print(f"\n=== Batch Inference Mode ({len(prompts)} sequences) ===")
+
+        # Tokenize all prompts
+        batch_input_ids = []
+        for i, prompt in enumerate(prompts):
+            if args.no_chat:
+                ids = tokenizer.encode(prompt)
+            else:
+                messages = [{"role": "user", "content": prompt}]
+                chat_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                ids = tokenizer.encode(chat_text)
+            batch_input_ids.append(ids)
+            print(f"  Prompt {i}: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\" ({len(ids)} tokens)")
+
+        print("-" * 50)
+        t_start = time.time()
+        batch_output_ids = generate_batch(
+            model, batch_input_ids, tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            eos_token_id=eos_token_id,
+            do_sample=not args.greedy,
+            paged_block_size=args.block_size,
+            paged_max_blocks=args.max_blocks,
+        )
+        total = time.time() - t_start
+
+        print(f"\n{'='*50}")
+        total_gen = 0
+        for i in range(len(prompts)):
+            gen_ids = batch_output_ids[i][len(batch_input_ids[i]):]
+            gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            n = len(gen_ids)
+            total_gen += n
+            print(f"\n--- Sequence {i} ({n} tokens) ---")
+            print(f"Prompt: {prompts[i]}")
+            print(f"Response: {gen_text}")
+        print(f"\n{'='*50}")
+        print(f"Total: {total_gen} tokens from {len(prompts)} sequences in {total:.1f}s "
+              f"({total_gen/total:.2f} tok/s effective throughput)")
+
     else:
-        messages = [{"role": "user", "content": args.prompt}]
-        chat_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        input_ids = tokenizer.encode(chat_text)
-        print(f"Chat template applied: {repr(chat_text[:120])}...")
+        # === Single Sequence Mode ===
+        if args.no_chat:
+            input_ids = tokenizer.encode(args.prompt)
+        else:
+            messages = [{"role": "user", "content": args.prompt}]
+            chat_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            input_ids = tokenizer.encode(chat_text)
+            print(f"Chat template applied: {repr(chat_text[:120])}...")
 
-    print(f"\nPrompt: {args.prompt}")
-    print(f"Tokens: {len(input_ids)}")
-    print("-" * 50)
+        print(f"\nPrompt: {args.prompt}")
+        print(f"Tokens: {len(input_ids)}")
+        print("-" * 50)
 
-    # Generate
-    if args.paged:
-        print(f"KV Cache mode: Paged Attention (block_size={args.block_size}, max_blocks={args.max_blocks})")
-    else:
-        print(f"KV Cache mode: Contiguous (pre-allocated)")
-    
-    t_start = time.time()
-    output_ids = generate(
-        model, input_ids, tokenizer,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        eos_token_id=config.get("eos_token_id", tokenizer.eos_token_id or 151643),
-        do_sample=not args.greedy,
-        use_paged_cache=args.paged,
-        paged_block_size=args.block_size,
-        paged_max_blocks=args.max_blocks,
-    )
-    total = time.time() - t_start
+        if args.paged:
+            print(f"KV Cache mode: Paged Attention (block_size={args.block_size}, max_blocks={args.max_blocks})")
+        else:
+            print(f"KV Cache mode: Contiguous (pre-allocated)")
 
-    gen_text = tokenizer.decode(output_ids[len(input_ids):], skip_special_tokens=True)
-    n = len(output_ids) - len(input_ids)
-    print(f"\n{'='*50}")
-    print(f"Generated ({n} tokens in {total:.1f}s, {n/total:.2f} tok/s):")
-    print(gen_text)
+        t_start = time.time()
+        output_ids = generate(
+            model, input_ids, tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            eos_token_id=eos_token_id,
+            do_sample=not args.greedy,
+            use_paged_cache=args.paged,
+            paged_block_size=args.block_size,
+            paged_max_blocks=args.max_blocks,
+        )
+        total = time.time() - t_start
+
+        gen_text = tokenizer.decode(output_ids[len(input_ids):], skip_special_tokens=True)
+        n = len(output_ids) - len(input_ids)
+        print(f"\n{'='*50}")
+        print(f"Generated ({n} tokens in {total:.1f}s, {n/total:.2f} tok/s):")
+        print(gen_text)
 
 
 if __name__ == "__main__":
