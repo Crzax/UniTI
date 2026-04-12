@@ -40,16 +40,25 @@ list(APPEND LINKER_LIBS ${pybind11_LIBRARIES})
 ### CPU BACKEND ###
 ###################
 # Find OpenBLAS for high-performance matrix multiplication (optional)
+# Prefer multi-threaded (pthread) variant 'openblasp' for better performance.
 find_path(CBLAS_INCLUDE_DIR cblas.h
   HINTS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
         /usr/include/openblas
 )
-find_library(OPENBLAS_LIB openblas
-  HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
-        /usr/lib64
+find_library(OPENBLAS_LIB_MT openblasp
+  HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib /usr/lib64
 )
+find_library(OPENBLAS_LIB_ST openblas
+  HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib /usr/lib64
+)
+if(OPENBLAS_LIB_MT)
+  set(OPENBLAS_LIB ${OPENBLAS_LIB_MT})
+  message(STATUS "Using multi-threaded OpenBLAS: ${OPENBLAS_LIB}")
+elseif(OPENBLAS_LIB_ST)
+  set(OPENBLAS_LIB ${OPENBLAS_LIB_ST})
+  message(STATUS "Using single-threaded OpenBLAS: ${OPENBLAS_LIB}")
+endif()
 message(STATUS "OpenBLAS include: ${CBLAS_INCLUDE_DIR}")
-message(STATUS "OpenBLAS lib: ${OPENBLAS_LIB}")
 
 add_library(ndarray_backend_cpu MODULE src/ndarray_backend_cpu.cc)
 

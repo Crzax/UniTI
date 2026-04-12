@@ -563,79 +563,116 @@ void EmbeddingLookup(const CudaArray& weight, const CudaArray& ids, CudaArray* o
 //   MatmulKernel<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
 // }
 
-#define L 32
-#define S 32
-__global__ void MatmulKernel(const scalar_t* a, const scalar_t* b, scalar_t* out, 
-                             uint32_t M, uint32_t N, uint32_t P) {
-  __shared__ scalar_t sA[S][L*TILE], sB[S][L*TILE];
-  scalar_t c[TILE][TILE] = {0};
-  int tx = threadIdx.x, ty = threadIdx.y;
-  int grow = blockIdx.y * blockDim.y;
-  int gcol = blockIdx.x * blockDim.x;
+/*
+ * High-performance SGEMM kernel.
+ *
+ * Each thread-block computes a BM x BN tile of C.
+ * Shared memory tiles: A -> BM x BK, B -> BK x BN.
+ * Each thread computes a TM x TN sub-tile via register blocking.
+ *
+ * Block config: 256 threads (16 x 16), each handles 8x8 output elements.
+ * Covers 128 x 128 output per block, iterating over K in steps of 8.
+ */
+#define BM 128
+#define BN 128
+#define BK 8
+#define TM 8
+#define TN 8
+
+__global__ void MatmulKernel(const scalar_t* __restrict__ A,
+                              const scalar_t* __restrict__ B,
+                              scalar_t* __restrict__ C,
+                              uint32_t M, uint32_t N, uint32_t P) {
+  const int bx = blockIdx.x;  // column block index
+  const int by = blockIdx.y;  // row block index
+  const int tx = threadIdx.x; // 0..15
+  const int ty = threadIdx.y; // 0..15
+  const int tid = ty * blockDim.x + tx; // 0..255
+
+  // Each thread computes TM x TN = 8x8 outputs.
+  // Thread (ty, tx) covers rows [by*BM + ty*TM .. +TM) and cols [bx*BN + tx*TN .. +TN).
+  const int row0 = by * BM + ty * TM;
+  const int col0 = bx * BN + tx * TN;
+
+  // Shared memory for A-tile (BM x BK) and B-tile (BK x BN).
+  // Pad by 1 to avoid bank conflicts on the K dimension.
+  __shared__ scalar_t sA[BM][BK + 1];
+  __shared__ scalar_t sB[BK][BN + 1];
+
+  // Accumulator registers
+  scalar_t acc[TM][TN];
 #pragma unroll
-  for (int i = 0; i < (N + S - 1)/ S; ++i) {
-    // global->shared
-    int nthreads = blockDim.x * blockDim.y;
+  for (int i = 0; i < TM; i++)
 #pragma unroll
-    for (int j = 0; j < S*L*TILE / nthreads; ++j) {
-      int thread_idx = ty * blockDim.x + tx;
-      int sa_row = (j * nthreads + thread_idx) / (L*TILE);
-      int sa_col = (j * nthreads + thread_idx) % (L*TILE);
-      int a_base = grow * TILE * N + i * S;
-      if (((sa_col + grow * TILE) < M) && (i * S + sa_row < N)) {
-        sA[sa_row][sa_col] = a[a_base + sa_col * N + sa_row];
-      } else
-        sA[sa_row][sa_col] = 0.0;
+    for (int j = 0; j < TN; j++)
+      acc[i][j] = 0.0f;
+
+  // Number of K-tiles
+  const int nk = (N + BK - 1) / BK;
+
+  for (int t = 0; t < nk; t++) {
+    // Cooperative load: 256 threads load BM*BK = 1024 elements of A
+    // and BK*BN = 1024 elements of B, i.e. 4 loads each.
+#pragma unroll
+    for (int i = 0; i < (BM * BK) / 256; i++) {
+      int idx = i * 256 + tid;
+      int r = idx / BK;
+      int c = idx % BK;
+      int gr = by * BM + r;
+      int gc = t * BK + c;
+      sA[r][c] = (gr < M && gc < N) ? A[gr * N + gc] : 0.0f;
     }
 #pragma unroll
-    for (int j = 0; j < S * L * TILE / nthreads; ++j) {
-      int thread_idx = ty * blockDim.x + tx;
-      int sb_row = (j * nthreads + thread_idx) / (L*TILE);
-      int sb_col = (j * nthreads + thread_idx) % (L*TILE);
-      int b_base = i * S * P + gcol * TILE; 
-      if (((sb_col + gcol * TILE) < P) && (i * S + sb_row < N)) {
-        sB[sb_row][sb_col] = b[b_base + sb_row * P + sb_col];
-      } else
-        sB[sb_row][sb_col] = 0.0;
+    for (int i = 0; i < (BK * BN) / 256; i++) {
+      int idx = i * 256 + tid;
+      int r = idx / BN;
+      int c = idx % BN;
+      int gr = t * BK + r;
+      int gc = bx * BN + c;
+      sB[r][c] = (gr < N && gc < P) ? B[gr * P + gc] : 0.0f;
     }
     __syncthreads();
-    // compute
+
+    // Compute: each thread does TM x TN outer products over BK
 #pragma unroll
-    for (int j = 0; j < S; ++ j) {
-      // shared->register
-      scalar_t a[TILE] = {0};
-      for (int k = 0; k < TILE; ++k) {
-        a[k] = sA[j][ty * TILE + k];
-      }
-      scalar_t b[TILE] = {0};
-      for (int k = 0; k < TILE; ++k) {
-        b[k] = sB[j][tx * TILE + k];
-      }
-      for (int k1 = 0; k1 < TILE; ++k1)
-        for (int k2 = 0; k2 < TILE; ++k2) {
-          c[k1][k2] += a[k1] * b[k2];
-        }
+    for (int k = 0; k < BK; k++) {
+      scalar_t ra[TM], rb[TN];
+#pragma unroll
+      for (int i = 0; i < TM; i++)
+        ra[i] = sA[ty * TM + i][k];
+#pragma unroll
+      for (int j = 0; j < TN; j++)
+        rb[j] = sB[k][tx * TN + j];
+#pragma unroll
+      for (int i = 0; i < TM; i++)
+#pragma unroll
+        for (int j = 0; j < TN; j++)
+          acc[i][j] += ra[i] * rb[j];
     }
     __syncthreads();
   }
-  // register -> global
+
+  // Write results back to global memory
 #pragma unroll
-  for (int i = 0; i < TILE; ++i)
+  for (int i = 0; i < TM; i++) {
+    int gr = row0 + i;
+    if (gr < M) {
 #pragma unroll
-    for (int j = 0; j < TILE; ++j) {
-      int out_row = grow * TILE + ty * TILE + i;
-      int out_col = gcol * TILE + tx * TILE + j;
-      if ((out_row < M) && (out_col < P)) {
-        out[out_row * P + out_col] = c[i][j];
+      for (int j = 0; j < TN; j++) {
+        int gc = col0 + j;
+        if (gc < P) {
+          C[gr * P + gc] = acc[i][j];
+        }
       }
     }
+  }
 }
 
-void Matmul(const CudaArray& a, const CudaArray& b, CudaArray* out, 
+void Matmul(const CudaArray& a, const CudaArray& b, CudaArray* out,
             uint32_t M, uint32_t N, uint32_t P) {
-  dim3 block(L, L, 1);
-  dim3 grid((P + L * TILE-1)/(L*TILE), (M+L*TILE-1)/(L*TILE), 1);
-  MatmulKernel<<<grid,block>>>(a.ptr,b.ptr,out->ptr,M,N,P);
+  dim3 block(BN / TN, BM / TM, 1);  // 16 x 16 = 256 threads
+  dim3 grid((P + BN - 1) / BN, (M + BM - 1) / BM, 1);
+  MatmulKernel<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
 }
 
 __global__ void ReduceMaxKernel(const scalar_t* a, scalar_t* out, size_t size, size_t redice_size) {

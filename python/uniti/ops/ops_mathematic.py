@@ -559,7 +559,8 @@ class SiLU(TensorOp):
     def gradient(self, out_grad, node):
         a = node.inputs[0]
         sig = Tensor(self.sigmoid_a, device=out_grad.device, dtype=out_grad.dtype, requires_grad=False)
-        return out_grad * (sig + a * sig * (1 - sig))
+        one = Tensor(self.sigmoid_a * 0 + 1, device=out_grad.device, dtype=out_grad.dtype, requires_grad=False)
+        return out_grad * (sig + a * sig * (one - sig))
 
 
 def silu(a):

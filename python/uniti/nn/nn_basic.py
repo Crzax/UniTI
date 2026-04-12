@@ -1,6 +1,6 @@
 """The module.
 """
-from typing import Any
+from typing import Any, Optional
 from uniti.autograd import Tensor
 from uniti import ops
 import uniti.init as init
@@ -80,7 +80,7 @@ class Identity(Module):
 
 
 class Linear(Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, device: Any | None = None, dtype: str = "float32") -> None:
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device: Optional[Any] = None, dtype: str = "float32") -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -147,7 +147,7 @@ class SoftmaxLoss(Module):
 
 
 class BatchNorm1d(Module):
-    def __init__(self, dim: int, eps: float = 1e-5, momentum: float = 0.1, device: Any | None = None, dtype: str = "float32") -> None:
+    def __init__(self, dim: int, eps: float = 1e-5, momentum: float = 0.1, device: Optional[Any] = None, dtype: str = "float32") -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
@@ -188,7 +188,7 @@ class BatchNorm2d(BatchNorm1d):
 
 
 class LayerNorm1d(Module):
-    def __init__(self, dim: int, eps: float = 1e-5, device: Any | None = None, dtype: str = "float32") -> None:
+    def __init__(self, dim: int, eps: float = 1e-5, device: Optional[Any] = None, dtype: str = "float32") -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
