@@ -277,7 +277,47 @@ def run_tests():
         test_cases.append(("SiLU", f"input_{i}", me, re, p))
         print(f"  [{'✓' if p else '✗'}] SiLU           input_{i}  max_err={me:.2e}  rel_err={re:.2e}  {status}")
 
-    # ── 20. Composite: Linear layer ──
+    # ── 20. Sqrt ──
+    def test_sqrt(a): return ops.sqrt(a)
+    results = check_gradient("Sqrt", test_sqrt, [(3, 4)], positive=True, tol=2e-2)
+    for i, me, re, p in results:
+        status = "PASS" if p else "FAIL"
+        if p: passed_count += 1
+        else: failed_count += 1
+        test_cases.append(("Sqrt", f"input_{i}", me, re, p))
+        print(f"  [{'✓' if p else '✗'}] Sqrt           input_{i}  max_err={me:.2e}  rel_err={re:.2e}  {status}")
+
+    # ── 21. Sin ──
+    def test_sin(a): return ops.sin(a)
+    results = check_gradient("Sin", test_sin, [(3, 4)])
+    for i, me, re, p in results:
+        status = "PASS" if p else "FAIL"
+        if p: passed_count += 1
+        else: failed_count += 1
+        test_cases.append(("Sin", f"input_{i}", me, re, p))
+        print(f"  [{'✓' if p else '✗'}] Sin            input_{i}  max_err={me:.2e}  rel_err={re:.2e}  {status}")
+
+    # ── 22. Cos ──
+    def test_cos(a): return ops.cos(a)
+    results = check_gradient("Cos", test_cos, [(3, 4)])
+    for i, me, re, p in results:
+        status = "PASS" if p else "FAIL"
+        if p: passed_count += 1
+        else: failed_count += 1
+        test_cases.append(("Cos", f"input_{i}", me, re, p))
+        print(f"  [{'✓' if p else '✗'}] Cos            input_{i}  max_err={me:.2e}  rel_err={re:.2e}  {status}")
+
+    # ── 23. Concatenate ──
+    def test_concat(a, b): return ops.concatenate([a, b], axis=0)
+    results = check_gradient("Concatenate", test_concat, [(3, 4), (2, 4)])
+    for i, me, re, p in results:
+        status = "PASS" if p else "FAIL"
+        if p: passed_count += 1
+        else: failed_count += 1
+        test_cases.append(("Concatenate", f"input_{i}", me, re, p))
+        print(f"  [{'✓' if p else '✗'}] Concatenate    input_{i}  max_err={me:.2e}  rel_err={re:.2e}  {status}")
+
+    # ── 24. Composite: Linear layer ──
     fixed_W = np.random.randn(4, 3).astype(np.float32) * 0.1
     def test_linear(x):
         W = Tensor(fixed_W.copy(), requires_grad=False)
