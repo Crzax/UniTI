@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import uniti
 from uniti.autograd import Tensor, no_grad
 from uniti.nn.nn_qwen2 import Qwen2ForCausalLM
-from uniti.backend_selection import cuda, cpu_numpy, cpu
+from uniti.backend_selection import cuda, cpu_numpy, cpu, metal
 from uniti.safetensors_loader import load_safetensors, load_safetensors_sharded
 from uniti.tokenizer import UniTITokenizer
 
@@ -30,6 +30,11 @@ def get_device(device_name: str):
         dev = cuda()
         if not dev.enabled():
             raise RuntimeError("CUDA backend not available. Please compile with CUDA support.")
+        return dev
+    elif device_name == "metal":
+        dev = metal()
+        if not dev.enabled():
+            raise RuntimeError("Metal backend not available. Requires macOS + Apple Silicon + metalcompute.")
         return dev
     elif device_name == "cpu":
         return cpu()
@@ -419,8 +424,8 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--no_chat", action="store_true", help="Skip chat template, use raw prompt")
-    parser.add_argument("--device", default="cpu_numpy", choices=["cuda", "cpu", "cpu_numpy"],
-                        help="Device to run inference on (cuda/cpu/cpu_numpy)")
+    parser.add_argument("--device", default="cpu_numpy", choices=["cuda", "cpu", "cpu_numpy", "metal"],
+                        help="Device to run inference on (cuda/cpu/cpu_numpy/metal)")
     parser.add_argument("--paged", action="store_true",
                         help="Use Paged Attention for KV cache (vLLM-style block memory management)")
     parser.add_argument("--block_size", type=int, default=16,

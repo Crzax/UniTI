@@ -11,6 +11,7 @@ if BACKEND == "nd":
     from .backend_ndarray import (
         all_devices,
         cuda,
+        metal,
         cpu,
         cpu_numpy,
         default_device,

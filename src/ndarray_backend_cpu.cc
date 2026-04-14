@@ -8,9 +8,15 @@
 #include <algorithm>
 #include <cstring>
 
-// OpenBLAS for high-performance matrix multiplication (optional)
+// BLAS for high-performance matrix multiplication (optional)
+// Supports both OpenBLAS (Linux) and Apple Accelerate (macOS/Apple Silicon)
 #ifdef USE_OPENBLAS
-#include <cblas.h>
+  #ifdef __APPLE__
+    #define ACCELERATE_NEW_LAPACK
+    #include <Accelerate/Accelerate.h>
+  #else
+    #include <cblas.h>
+  #endif
 #endif
 
 namespace uniti {

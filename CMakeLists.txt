@@ -25,7 +25,13 @@ find_package(pybind11 PATHS ${__pybind_path} NO_DEFAULT_PATH)
 
 
 if(NOT MSVC)
-  set(CMAKE_CXX_FLAGS "-std=c++11 -O2 -march=native ${CMAKE_CXX_FLAGS}")
+  # On Apple Silicon (arm64), -march=native may not be recognized by all compilers;
+  # use -mcpu=apple-m1 (covers M1–M5) for optimal NEON/AMX code generation.
+  if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+    set(CMAKE_CXX_FLAGS "-std=c++11 -O2 ${CMAKE_CXX_FLAGS}")
+  else()
+    set(CMAKE_CXX_FLAGS "-std=c++11 -O2 -march=native ${CMAKE_CXX_FLAGS}")
+  endif()
   set(CMAKE_CUDA_STANDARD 14)
 else()
   set(CMAKE_CXX_FLAGS "/std:c++11 -O2 -march=native ${CMAKE_CXX_FLAGS}")
@@ -39,37 +45,64 @@ list(APPEND LINKER_LIBS ${pybind11_LIBRARIES})
 ###################
 ### CPU BACKEND ###
 ###################
-# Find OpenBLAS for high-performance matrix multiplication (optional)
-# Prefer multi-threaded (pthread) variant 'openblasp' for better performance.
-find_path(CBLAS_INCLUDE_DIR cblas.h
-  HINTS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
-        /usr/include/openblas
-)
-find_library(OPENBLAS_LIB_MT openblasp
-  HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib /usr/lib64
-)
-find_library(OPENBLAS_LIB_ST openblas
-  HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib /usr/lib64
-)
-if(OPENBLAS_LIB_MT)
-  set(OPENBLAS_LIB ${OPENBLAS_LIB_MT})
-  message(STATUS "Using multi-threaded OpenBLAS: ${OPENBLAS_LIB}")
-elseif(OPENBLAS_LIB_ST)
-  set(OPENBLAS_LIB ${OPENBLAS_LIB_ST})
-  message(STATUS "Using single-threaded OpenBLAS: ${OPENBLAS_LIB}")
+# BLAS detection: prefer Apple Accelerate on macOS, OpenBLAS on Linux.
+# Apple Accelerate provides highly optimized BLAS/LAPACK for Apple Silicon (M1–M5),
+# using the AMX coprocessor for matrix operations — no extra installation needed.
+
+set(BLAS_FOUND FALSE)
+
+if(APPLE)
+  # macOS: use Apple Accelerate framework (built-in, zero-install)
+  # Accelerate includes a full cblas.h and vecLib with AMX acceleration on Apple Silicon.
+  find_library(ACCELERATE_FRAMEWORK Accelerate)
+  if(ACCELERATE_FRAMEWORK)
+    set(BLAS_FOUND TRUE)
+    set(BLAS_BACKEND "Apple Accelerate")
+    message(STATUS "Apple Accelerate found — using AMX-accelerated BLAS for Apple Silicon")
+  endif()
 endif()
-message(STATUS "OpenBLAS include: ${CBLAS_INCLUDE_DIR}")
+
+if(NOT BLAS_FOUND)
+  # Linux / other: find OpenBLAS
+  find_path(CBLAS_INCLUDE_DIR cblas.h
+    HINTS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
+          /usr/include/openblas
+  )
+  find_library(OPENBLAS_LIB_MT openblasp
+    HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib /usr/lib64
+  )
+  find_library(OPENBLAS_LIB_ST openblas
+    HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib /usr/lib64
+  )
+  if(OPENBLAS_LIB_MT)
+    set(OPENBLAS_LIB ${OPENBLAS_LIB_MT})
+    message(STATUS "Using multi-threaded OpenBLAS: ${OPENBLAS_LIB}")
+  elseif(OPENBLAS_LIB_ST)
+    set(OPENBLAS_LIB ${OPENBLAS_LIB_ST})
+    message(STATUS "Using single-threaded OpenBLAS: ${OPENBLAS_LIB}")
+  endif()
+  if(CBLAS_INCLUDE_DIR AND OPENBLAS_LIB)
+    set(BLAS_FOUND TRUE)
+    set(BLAS_BACKEND "OpenBLAS")
+  endif()
+endif()
 
 add_library(ndarray_backend_cpu MODULE src/ndarray_backend_cpu.cc)
 
-if(CBLAS_INCLUDE_DIR AND OPENBLAS_LIB)
-  message(STATUS "OpenBLAS found — using BLAS-accelerated matmul")
+if(BLAS_FOUND)
   target_compile_definitions(ndarray_backend_cpu PRIVATE USE_OPENBLAS=1)
-  target_include_directories(ndarray_backend_cpu PRIVATE ${CBLAS_INCLUDE_DIR})
-  target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS} ${OPENBLAS_LIB})
+  if(APPLE AND ACCELERATE_FRAMEWORK)
+    message(STATUS "BLAS backend: Apple Accelerate (AMX-accelerated on Apple Silicon)")
+    target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS} ${ACCELERATE_FRAMEWORK})
+  else()
+    message(STATUS "BLAS backend: OpenBLAS")
+    target_include_directories(ndarray_backend_cpu PRIVATE ${CBLAS_INCLUDE_DIR})
+    target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS} ${OPENBLAS_LIB})
+  endif()
 else()
-  message(WARNING "OpenBLAS NOT found — CPU matmul will use naive fallback (slow). "
-                  "Install OpenBLAS for better performance: apt install libopenblas-dev / yum install openblas-devel")
+  message(WARNING "No BLAS library found — CPU matmul will use naive fallback (slow). "
+                  "On macOS: Accelerate should be available by default. "
+                  "On Linux: apt install libopenblas-dev / yum install openblas-devel")
   target_link_libraries(ndarray_backend_cpu PUBLIC ${LINKER_LIBS})
 endif()
 
@@ -124,5 +157,32 @@ if(CUDA_FOUND)
     CUDA_VISIBILITY_PRESET "hidden"
 )
 
+endif()
+
+
+#####################
+### METAL BACKEND ###
+#####################
+# Apple Metal GPU backend — only built on macOS with Metal framework
+if(APPLE)
+  find_library(METAL_FRAMEWORK Metal)
+  find_library(FOUNDATION_FRAMEWORK Foundation)
+  if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+    message(STATUS "Found Metal framework — building Metal GPU backend")
+
+    add_library(ndarray_backend_metal MODULE src/ndarray_backend_metal.mm)
+    target_link_libraries(ndarray_backend_metal PUBLIC ${LINKER_LIBS} ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+    target_compile_options(ndarray_backend_metal PRIVATE -fobjc-arc)
+
+    pybind11_extension(ndarray_backend_metal)
+    pybind11_strip(ndarray_backend_metal)
+
+    set_target_properties(ndarray_backend_metal
+      PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/uniti/backend_ndarray
+      CXX_VISIBILITY_PRESET "hidden"
+    )
+    set_property(TARGET ndarray_backend_metal PROPERTY LINK_OPTIONS -undefined dynamic_lookup)
+  endif()
 endif()
 

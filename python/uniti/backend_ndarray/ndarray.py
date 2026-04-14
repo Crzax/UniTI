@@ -3,7 +3,11 @@ import math
 from functools import reduce
 import numpy as np
 from . import ndarray_backend_numpy
-from . import ndarray_backend_cpu
+
+try:
+    from . import ndarray_backend_cpu
+except ImportError:
+    ndarray_backend_cpu = None
 
 
 # math.prod not in Python 3.7
@@ -98,6 +102,15 @@ def cuda():
         return BackendDevice("cuda", None)
 
 
+def metal():
+    """Return Apple Metal GPU device"""
+    try:
+        from . import ndarray_backend_metal
+        return BackendDevice("metal", ndarray_backend_metal)
+    except ImportError:
+        return BackendDevice("metal", None)
+
+
 def cpu_numpy():
     """Return numpy device"""
     return BackendDevice("cpu_numpy", ndarray_backend_numpy)
@@ -105,7 +118,9 @@ def cpu_numpy():
 
 def cpu():
     """Return cpu device"""
-    return BackendDevice("cpu", ndarray_backend_cpu)
+    if ndarray_backend_cpu is not None:
+        return BackendDevice("cpu", ndarray_backend_cpu)
+    return BackendDevice("cpu", None)
 
 
 def default_device():
@@ -114,7 +129,7 @@ def default_device():
 
 def all_devices():
     """return a list of all available devices"""
-    return [cpu(), cuda(), cpu_numpy()]
+    return [cpu(), cuda(), cpu_numpy(), metal()]
 
 
 class NDArray:
